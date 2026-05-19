@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Incident Assistant</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; background-color: #f8f9fa; color: #212529; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }
+        textarea { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #ced4da; border-radius: 6px; min-height: 120px; font-family: monospace; margin-bottom: 10px; }
+        button { background-color: #0d6efd; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; }
+        button:disabled { background-color: #6c757d; cursor: not-allowed; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-top: 20px; border: 1px solid #e9ecef; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; text-transform: uppercase; font-size: 12px; }
+        .severity-high { background-color: #dc3545; color: white; }
+        .severity-medium { background-color: #ffc107; color: black; }
+        .severity-low { background-color: #198754; color: white; }
+        .hypothesis { background-color: #f8f9fa; border-left: 4px solid #0d6efd; padding: 15px; margin-bottom: 15px; }
+        #loader, #errorBox { display: none; margin-top: 15px; }
+        #errorBox { color: #dc3545; font-weight: bold; background: #f8d7da; padding: 10px; border-radius: 6px; border: 1px solid #f5c2c7;}
+    </style>
+</head>
+<body>
+    <h2>On-Call Incident Assistant</h2>
+    <p>Describe the incident and paste relevant logs below.</p>
+    
+    <textarea id="incidentInput" placeholder="Paste logs here..."></textarea>
+    <button id="analyzeBtn" onclick="analyze()">Analyze Logs</button>
+    <div id="loader">Agent is analyzing... Please wait.</div>
+    <div id="errorBox"></div>
+    <div id="result" class="card" style="display: none;"></div>
+
+    <script>
+        async function analyze() {
+            const btn = document.getElementById('analyzeBtn');
+            const loader = document.getElementById('loader');
+            const resultDiv = document.getElementById('result');
+            const errorBox = document.getElementById('errorBox');
+            const text = document.getElementById('incidentInput').value;
+
+            if (!text.trim()) return;
+
+            btn.disabled = true;
+            loader.style.display = 'block';
+            resultDiv.style.display = 'none';
+            errorBox.style.display = 'none';
+
+            try {
+                const response = await fetch('/api/v1/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ incident_text: text })
+                });
+
+                if (!response.ok) {
+                    const errData = await response.json();
+                    let errorMessage = "An unknown API error occurred.";
+                    
+                    // Handle Pydantic validation errors (Array) vs custom HTTP exceptions (String)
+                    if (errData.detail) {
+                        if (typeof errData.detail === 'string') {
+                            errorMessage = errData.detail;
+                        } else if (Array.isArray(errData.detail)) {
+                            // Extract the specific 'msg' from Pydantic's error array
+                            errorMessage = errData.detail.map(e => e.msg).join(" | ");
+                        } else {
+                            errorMessage = JSON.stringify(errData.detail);
+                        }
+                    }
+                    throw new Error(errorMessage);
+                }
+                
+                renderResult(await response.json());
+            } catch (error) {
+                // Ensure error is displayed as a clean string
+                errorBox.textContent = `Validation Error: ${error.message}`;
+                errorBox.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                loader.style.display = 'none';
+            }
+        }
+
+        // Helper function for secure DOM manipulation
+        function createEl(tag, text = null, className = null) {
+            const el = document.createElement(tag);
+            if (text) el.textContent = text;
+            if (className) el.className = className;
+            return el;
+        }
+
+        function renderResult(data) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.innerHTML = ''; 
+            
+            // Header: Category and Severity
+            const headerDiv = createEl('div');
+            headerDiv.style.display = 'flex';
+            headerDiv.style.justifyContent = 'space-between';
+            
+            headerDiv.appendChild(createEl('h3', `[${data.category}]`));
+            headerDiv.appendChild(createEl('span', data.severity, `badge severity-${data.severity.toLowerCase()}`));
+            resultDiv.appendChild(headerDiv);
+
+            // Metadata
+            const metaDiv = createEl('div');
+            const pUsers = createEl('p');
+            pUsers.appendChild(createEl('strong', 'Affected Users: '));
+            pUsers.appendChild(document.createTextNode(data.affected_users));
+            
+            const pReason = createEl('p');
+            pReason.appendChild(createEl('strong', 'Severity Reason: '));
+            pReason.appendChild(document.createTextNode(data.severity_reason));
+
+            const pSummary = createEl('p');
+            pSummary.appendChild(createEl('strong', 'Summary: '));
+            pSummary.appendChild(document.createTextNode(data.summary));
+
+            metaDiv.appendChild(pUsers);
+            metaDiv.appendChild(pReason);
+            metaDiv.appendChild(pSummary);
+            resultDiv.appendChild(metaDiv);
+
+            resultDiv.appendChild(createEl('hr'));
+            resultDiv.appendChild(createEl('h4', 'Hypotheses'));
+
+            // Hypotheses Loop
+            data.hypotheses.forEach(h => {
+                const hypDiv = createEl('div', null, 'hypothesis');
+                
+                const titleEl = createEl('h5', h.title);
+                titleEl.style.margin = '0 0 5px 0';
+                hypDiv.appendChild(titleEl);
+
+                const reasonEl = createEl('p', `Reasoning: ${h.reasoning}`);
+                reasonEl.style.fontSize = '14px';
+                reasonEl.style.fontStyle = 'italic';
+                hypDiv.appendChild(reasonEl);
+
+                const ul = createEl('ul');
+                ul.style.fontSize = '14px';
+                h.next_steps.forEach(step => {
+                    ul.appendChild(createEl('li', step));
+                });
+                hypDiv.appendChild(ul);
+
+                resultDiv.appendChild(hypDiv);
+            });
+
+            resultDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
