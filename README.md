@@ -7,19 +7,25 @@ Focuses on architectural cleanliness, strict JSON data contracts, and LLM safety
 
 1. **Copy the environment template and add your API key:**
 
-       cp .env.example .env
-       # Edit .env and insert your OPENAI_API_KEY
+```bash
+   cp .env.example .env
+   # Edit .env and insert your OPENAI_API_KEY
+```
 
 2. **Install dependencies in a virtual environment:**
 
-       python -m venv venv
-       # Windows: venv\Scripts\activate
-       # Linux/Mac: source venv/bin/activate
-       pip install -r requirements.txt
+```bash
+   python -m venv venv
+   # Windows: venv\Scripts\activate
+   # Linux/Mac: source venv/bin/activate
+   pip install -r requirements.txt
+```
 
 3. **Start the FastAPI server:**
 
-       uvicorn app.main:app --reload
+```bash
+   uvicorn app.main:app --reload
+```
 
 4. **Access the UI:**
    Navigate to http://localhost:8000 in your browser.
@@ -31,7 +37,9 @@ Focuses on architectural cleanliness, strict JSON data contracts, and LLM safety
 The project includes pytest tests covering the LLM retry logic and Pydantic validation (with mocked OpenAI responses).
 Run the test suite via:
 
-    pytest tests/ -v
+```bash
+pytest tests/ -v
+```
 
 ### Manual Test Cases & Expected Outputs
 
@@ -54,15 +62,17 @@ Other services look normal.
   "affected_users": "All customers attempting to checkout via card payments",
   "summary": "The external provider PayGate is not responding in time, causing mass card payment failures.",
   "hypotheses": [
-    {
-      "title": "Degradation or incident on the PayGate side",
-      "reasoning": "Timeouts are observed exclusively when making outbound calls to PayGate, while all internal downstream services remain stable.",
-      "next_steps": [
-        "Check PayGate public status page and recent provider maintenance notifications.",
-        "Compare error rates and latency metrics across alternative payment providers.",
-        "Temporarily reroute card payment traffic to a backup payment gateway if available."
-      ]
-    }
+```json
+{
+  "title": "Degradation or incident on the PayGate side",
+  "reasoning": "Timeouts are observed exclusively when making outbound calls to PayGate, while all internal downstream services remain stable.",
+  "next_steps": [
+    "Check PayGate public status page and recent provider maintenance notifications.",
+    "Compare error rates and latency metrics across alternative payment providers.",
+    "Temporarily reroute card payment traffic to a backup payment gateway if available."
+  ]
+}
+```
   ]
 }
 
@@ -83,15 +93,17 @@ Some clients receive 504 Gateway Timeout from api-gateway.
   "affected_users": "Active users attempting to create new transactions and complete checkouts.",
   "summary": "Heavy analytical queries triggered by reporting-service are exhausting PostgreSQL CPU resources, blocking payment-service DB connections.",
   "hypotheses": [
-    {
-      "title": "PostgreSQL connection pool exhaustion and CPU spikes due to reporting queries",
-      "reasoning": "Reporting queries are scanning large transactional tables without proper read-replica isolation, locking shared database resources.",
-      "next_steps": [
-        "Execute a query on pg_stat_activity to identify and terminate long-running analytical processes.",
-        "Check connection pool saturation metrics on the payment-service database instance.",
-        "Verify if heavy analytical exports can be forcefully restricted during peak hours."
-      ]
-    }
+```json
+{
+  "title": "PostgreSQL connection pool exhaustion and CPU spikes due to reporting queries",
+  "reasoning": "Reporting queries are scanning large transactional tables without proper read-replica isolation, locking shared database resources.",
+  "next_steps": [
+    "Execute a query on pg_stat_activity to identify and terminate long-running analytical processes.",
+    "Check connection pool saturation metrics on the payment-service database instance.",
+    "Verify if heavy analytical exports can be forcefully restricted during peak hours."
+  ]
+}
+```
   ]
 }
 
@@ -112,15 +124,17 @@ Internal log messages indicate invalid token signatures while other services fun
   "affected_users": "All mobile application users attempting to authenticate or refresh sessions.",
   "summary": "The auth-service is rejecting incoming authentication tokens due to verification signature mismatches.",
   "hypotheses": [
-    {
-      "title": "Asymmetric JWT signing key mismatch or out-of-sync vault secrets",
-      "reasoning": "Invalid token signatures imply that the keys used to sign the tokens do not match the keys used for verification across distributed service pods.",
-      "next_steps": [
-        "Check recent secret rotation logs in Vault or the configuration management system.",
-        "Verify token verification public key synchronization across all active auth-service pods.",
-        "Inspect auth-service pod logs for explicit cryptographic or key loading errors."
-      ]
-    }
+```json
+{
+  "title": "Asymmetric JWT signing key mismatch or out-of-sync vault secrets",
+  "reasoning": "Invalid token signatures imply that the keys used to sign the tokens do not match the keys used for verification across distributed service pods.",
+  "next_steps": [
+    "Check recent secret rotation logs in Vault or the configuration management system.",
+    "Verify token verification public key synchronization across all active auth-service pods.",
+    "Inspect auth-service pod logs for explicit cryptographic or key loading errors."
+  ]
+}
+```
   ]
 }
 
@@ -141,15 +155,17 @@ notification-service logs display intermittent connection timeouts to the extern
   "affected_users": "Customers expecting immediate email alerts for successful balance top-ups.",
   "summary": "The notification-service is experiencing networking connection timeouts with the external upstream SMTP server.",
   "hypotheses": [
-    {
-      "title": "Upstream SMTP provider outage or network routing issues",
-      "reasoning": "Intermittent connection timeouts point toward network-level drops or throttling on the external provider side, while internal billing is healthy.",
-      "next_steps": [
-        "Verify network line connectivity and latency to the remote SMTP endpoint from inside the cluster.",
-        "Inspect the internal notification retry queue size and dead-letter queue metrics.",
-        "Check external email gateway status dashboards for known provider issues."
-      ]
-    }
+```json
+{
+  "title": "Upstream SMTP provider outage or network routing issues",
+  "reasoning": "Intermittent connection timeouts point toward network-level drops or throttling on the external provider side, while internal billing is healthy.",
+  "next_steps": [
+    "Verify network line connectivity and latency to the remote SMTP endpoint from inside the cluster.",
+    "Inspect the internal notification retry queue size and dead-letter queue metrics.",
+    "Check external email gateway status dashboards for known provider issues."
+  ]
+}
+```
   ]
 }
 
@@ -170,15 +186,17 @@ Logs show severe reporting-service load on the primary DB concurrent with networ
   "affected_users": "Customers executing payments and users expecting multi-factor SMS codes or transaction alerts.",
   "summary": "The platform is experiencing concurrent bottlenecks: internal database CPU saturation and external network connection drops to SMS providers.",
   "hypotheses": [
-    {
-      "title": "Cascading database connection delays combined with independent external SMS gateway timeout",
-      "reasoning": "The payment slowness correlates with reporting-service DB load, while the SMS failure is explicitly logged as an external network timeout.",
-      "next_steps": [
-        "Isolate database metrics to confirm if connection acquisition time is driving payment latency.",
-        "Check upstream SMS API endpoint availability and verify external gateway rate limits.",
-        "Evaluate the need to provision immediate read-replicas for heavy reporting queries."
-      ]
-    }
+```json
+{
+  "title": "Cascading database connection delays combined with independent external SMS gateway timeout",
+  "reasoning": "The payment slowness correlates with reporting-service DB load, while the SMS failure is explicitly logged as an external network timeout.",
+  "next_steps": [
+    "Isolate database metrics to confirm if connection acquisition time is driving payment latency.",
+    "Check upstream SMS API endpoint availability and verify external gateway rate limits.",
+    "Evaluate the need to provision immediate read-replicas for heavy reporting queries."
+  ]
+}
+```
   ]
 }
 
@@ -214,14 +232,16 @@ While the current MVP prioritizes KISS and rapid delivery, scaling this into a T
 
 ### Target Architecture Structure
 
-    app/
-      main.py
-      settings.py
-      schemas.py
-      agent/
-        analyzer.py       # Orchestrator
-        prompt_builder.py # Externalized prompt templates
-        retriever.py      # Vector/Semantic retrieval
-        llm_client.py     # Protocol and OpenAI implementation
-        exceptions.py     # Typed domain errors
-      context.py
+```text
+app/
+  main.py
+  settings.py
+  schemas.py
+  agent/
+    analyzer.py       # Orchestrator
+    prompt_builder.py # Externalized prompt templates
+    retriever.py      # Vector/Semantic retrieval
+    llm_client.py     # Protocol and OpenAI implementation
+    exceptions.py     # Typed domain errors
+  context.py
+```
