@@ -34,7 +34,10 @@ Focuses on architectural cleanliness, strict JSON data contracts, and LLM safety
 
 ## Testing
 
-The project includes pytest tests covering the LLM retry logic and Pydantic validation (with mocked OpenAI responses).
+The project includes pytest tests covering the LLM retry logic, Pydantic validation,
+context retrieval, and prompt assembly — all with a deterministic `MockLLMClient` stub
+(no real API calls required).
+
 Run the test suite via:
 
 ```bash
@@ -202,46 +205,107 @@ Logs show severe reporting-service load on the primary DB concurrent with networ
 
 ---
 
-## High-Level Architecture & Resilience
+## Architecture
 
-* **Schema Injection:** The exact Pydantic JSON schema is dynamically injected into the system prompt, enforcing a rigorous data contract on the LLM.
-* **Self-Correction (Recovery Loop):** If the LLM generates invalid JSON (or violates min_length constraints), Pydantic raises an error. The orchestrator intercepts this, feeds the specific error back to the LLM, and forces a correction.
-* **UI Safety:** All LLM outputs are aggressively escaped on the frontend before DOM insertion to prevent XSS.
-* **Configuration:** Core LLM behavior (temperature, model_name, max_retries) is externalized to .env for safe and fast tuning.
+The agent is structured as an explicit multi-stage pipeline aligned with SOLID principles.
+Each component has a single, well-defined responsibility and communicates through clean interfaces.
 
-## Future Evolution (What I would do with more time)
-
-While the current MVP prioritizes KISS and rapid delivery, scaling this into a Tier-1 production service requires addressing several architectural debts to fully align with SOLID principles.
-
-### 1. Architectural Decoupling (SRP & Dependency Inversion)
-* **Deconstruct the "God-Class":** The current IncidentAgent handles parsing, retrieval, prompt assembly, validation, and LLM communication. This violates the Single Responsibility Principle. I would split this into distinct domain components: IncidentParser, ContextRetriever, PromptBuilder, and an orchestrating IncidentAnalyzer.
-* **Abstract the LLM Client:** Currently, business logic is tightly coupled to the OpenAI SDK. Introducing an LLMClientProtocol (Dependency Inversion) would allow injecting dummy clients for deterministic unit testing without monkey-patching, and make it trivial to swap OpenAI for Anthropic or local models.
-* **Settings Management:** Replace direct os.getenv calls scattered across files with a centralized pydantic-settings configuration object to ensure environment variables are validated at startup.
-
-### 2. Prompt & Taxonomy Centralization (DRY)
-* **Externalize Prompts:** Hardcoding the system prompt inside the execution method hinders testing and version control. Prompts should be extracted into dedicated template modules.
-* **Unify Taxonomy:** The incident categories and severity rubrics currently exist in prompts, tests, and documentation. Extracting these into a single configuration module will enforce DRY and prevent taxonomy drift as the system scales.
-
-### 3. Production Resiliency & Lifecycle
-* **App Lifecycle Management:** Remove import-time side effects (like logger initialization and global agent instantiation in main.py). These should be managed using FastAPI's lifespan context managers to ensure clean startup and teardown phases.
-* **Resiliency & Error Handling:** Explicit timeouts and max-retry limits must be wrapped around the LLM client. Additionally, generic Exception catching should be replaced with domain-specific typed exceptions (e.g., LLMUnavailableError, LLMInvalidResponseError).
-* **API Schema Expansion:** The input schema (incident_text) is too naive for real observability. Future iterations will require a richer Pydantic schema including service, timestamp, environment, and correlation_ids for end-to-end tracing.
-
-### 4. Advanced Retrieval (RAG)
-* **Deterministic Retrieval:** The current keyword-overlap approach is fragile and prone to false positives. A dedicated ContextRetriever using vector embeddings (e.g., pgvector), semantic scoring, and stop-words is required to ensure the LLM receives highly relevant historical context without context-window overflow.
-
-### Target Architecture Structure
+### Module Structure
 
 ```text
 app/
-  main.py
-  settings.py
-  schemas.py
+  main.py           — FastAPI app, lifespan lifecycle, HTTP routing
+  settings.py       — Centralised pydantic-settings configuration (single source of truth)
+  schemas.py        — Pydantic data contracts (IncidentAnalysis, Hypothesis)
+  context.py        — Static knowledge base: system architecture + past incidents
   agent/
-    analyzer.py       # Orchestrator
-    prompt_builder.py # Externalized prompt templates
-    retriever.py      # Vector/Semantic retrieval
-    llm_client.py     # Protocol and OpenAI implementation
-    exceptions.py     # Typed domain errors
-  context.py
+    __init__.py
+    analyzer.py     — Orchestrator: coordinates all pipeline stages
+    retriever.py    — Stage 1+2: input parsing & keyword-based context retrieval
+    prompt_builder.py — Stage 3: system prompt assembly (taxonomy, severity rubric, schema injection)
+    llm_client.py   — Stage 4: LLMClientProtocol + OpenAI implementation
+    exceptions.py   — Typed domain exceptions (LLMUnavailableError, LLMInvalidResponseError)
+static/
+  index.html        — Simple web UI
+tests/
+  test_agent.py     — Pytest suite (uses MockLLMClient, no real API calls)
 ```
+
+### Pipeline Stages
+
+The request flows through four explicit, isolated stages:
+
+```
+User Input
+    │
+    ▼
+[1] ContextRetriever.parse_input()   — normalise text, extract keywords
+    │
+    ▼
+[2] ContextRetriever.retrieve()      — keyword-overlap RAG against past incidents
+    │
+    ▼
+[3] PromptBuilder.build_system_prompt()  — inject architecture + context + taxonomy + JSON schema
+    │
+    ▼
+[4] LLMClientProtocol.complete()     — call LLM, validate with Pydantic
+        │ ValidationError?
+        └─► self-correction loop (up to max_retries): append error → ask LLM to fix
+    │
+    ▼
+Structured IncidentAnalysis JSON
+```
+
+### Key Architectural Decisions
+
+**Dependency Inversion (LLMClientProtocol).** Business logic depends on the `LLMClientProtocol`
+abstract interface, not the concrete `openai` SDK. Tests inject `MockLLMClient` — a simple stub
+returning pre-set strings — without any monkey-patching. Swapping OpenAI for Anthropic or a local
+model requires only a new `LLMClientProtocol` implementation.
+
+**Single Responsibility.** `IncidentAnalyzer` only orchestrates. Parsing lives in `ContextRetriever`,
+prompt text lives in `PromptBuilder`, schema lives in `schemas.py`. Each module can be tested
+and evolved independently.
+
+**Centralised Configuration.** `Settings` (pydantic-settings) validates all environment variables
+at startup. No `os.getenv()` calls are scattered across business-logic modules.
+
+**Schema Injection.** The exact Pydantic JSON schema is dynamically injected into the system prompt,
+enforcing a rigorous data contract on the LLM output.
+
+**Self-Correction Loop.** If the LLM returns invalid JSON or violates `min_length` constraints,
+Pydantic raises a `ValidationError`. The orchestrator appends the error details to the conversation
+history and requests a correction — up to `MAX_RETRIES` times.
+
+**Typed Domain Exceptions.** `LLMUnavailableError` (network/API failure → HTTP 503) and
+`LLMInvalidResponseError` (validation exhausted → HTTP 422) allow `main.py` to return
+precise HTTP status codes without catching bare `Exception`.
+
+**FastAPI Lifespan.** All initialisation (logger, LLM client, analyzer) happens inside the
+`lifespan` async context manager — not at module import time. This eliminates import-time
+side effects and makes the startup/teardown sequence explicit and testable.
+
+---
+
+## Future Improvements
+
+The current implementation deliberately prioritises clean architecture over feature completeness.
+The following items remain as natural next steps:
+
+### 1. Advanced Retrieval (RAG)
+The current keyword-overlap retriever is a functional placeholder.
+A production system would use vector embeddings (e.g., pgvector or FAISS) with semantic scoring
+to ensure the LLM receives the most relevant historical context without polluting the context window.
+
+### 2. Richer Input Schema
+The current `incident_text` field is a raw string.
+Real observability pipelines would benefit from a structured input including
+`service`, `timestamp`, `environment`, and `correlation_id` fields for end-to-end tracing.
+
+### 3. LLM Resiliency
+Explicit request timeouts and circuit-breaker logic around `OpenAILLMClient` would prevent
+cascading failures when the upstream API is slow or rate-limiting.
+
+### 4. Prompt Versioning
+As the system scales, prompts should be stored in dedicated template files with version tags,
+enabling A/B testing and rollback without code changes.
