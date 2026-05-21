@@ -9,6 +9,9 @@ Key architectural decisions:
     making the dependency explicit and allowing overrides in tests.
   - Typed exceptions (LLMUnavailableError / LLMInvalidResponseError) are
     translated into precise HTTP status codes (503 / 422).
+  - Short-text validation raises HTTPException(400) explicitly in the route
+    rather than via Pydantic field_validator -- this preserves the correct
+    HTTP 400 (Bad Request) semantic, distinct from 422 (Unprocessable Entity).
 """
 import logging
 import sys
@@ -25,6 +28,13 @@ from app.agent.llm_client import OpenAILLMClient
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
 from app.agent.exceptions import LLMUnavailableError, LLMInvalidResponseError
+
+# Module-level logger: created once, reused on every request.
+logger = logging.getLogger(__name__)
+
+# Minimum requirements for a meaningful incident description.
+_MIN_WORDS = 5
+_MIN_CHARS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +68,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     settings = Settings()
     _setup_logging(settings)
-    logger = logging.getLogger(__name__)
 
     if settings.openai_api_key == "dummy_key":
         logger.warning("OPENAI_API_KEY is not set -- LLM calls will fail.")
@@ -111,18 +120,20 @@ async def analyze_incident(
     Analyse an incident description and return a structured JSON response.
 
     HTTP status codes:
-      400 -- text is too short or meaningless;
-      422 -- LLM failed to produce a valid response after all retries;
+      400 -- text is too short to provide meaningful context;
+      422 -- LLM failed to produce a valid response after all retries,
+             or request body is missing a required field;
       503 -- LLM API is temporarily unavailable;
       500 -- unexpected internal error.
     """
-    logger = logging.getLogger(__name__)
     text = req.incident_text.strip()
-
-    if len(text.split()) < 5 or len(text) < 30:
+    if len(text.split()) < _MIN_WORDS or len(text) < _MIN_CHARS:
         raise HTTPException(
             status_code=400,
-            detail="Incident text is too short. Please provide at least 5 words and 30 characters.",
+            detail=(
+                f"Incident text is too short. "
+                f"Please provide at least {_MIN_WORDS} words and {_MIN_CHARS} characters."
+            ),
         )
 
     try:
