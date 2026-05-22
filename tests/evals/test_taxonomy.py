@@ -80,8 +80,8 @@ class TestTaxonomyAccuracy:
         analyzer = make_analyzer([llm_response], max_retries=1)
         result = await analyzer.analyze(incident_text)
 
-        assert result["category"] == category, (
-            f"Expected category '{category}' but got '{result['category']}'"
+        assert result.category == category, (
+            f"Expected category '{category}' but got '{result.category}'"
         )
 
     def test_all_taxonomy_categories_are_covered(self):
@@ -118,8 +118,8 @@ class TestTaxonomyAccuracy:
         result = await analyzer.analyze(incident_text)
 
         # If model_validate_json accepted it, these are guaranteed present
-        assert "category" in result
-        assert "severity" in result
-        assert "hypotheses" in result
-        assert isinstance(result["hypotheses"], list)
-        assert len(result["hypotheses"]) >= 1
+        assert result.category is not None
+        assert result.severity is not None
+        assert result.hypotheses is not None
+        assert isinstance(result.hypotheses, list)
+        assert len(result.hypotheses) >= 1

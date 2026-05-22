@@ -9,7 +9,7 @@ Error response format for domain exceptions:
     {"code": "<machine_readable>", "message": "<human_readable>"}
 
 HTTPException responses (400 / Pydantic 422) keep FastAPI's default format:
-    {"detail": "..."}
+    {"detail": "..."} for compatibility with standard tooling.
 """
 import json
 
@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app, get_analyzer
 from app.agent.analyzer import IncidentAnalyzer
+from app.agent.input_parser import InputParser
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
 from app.agent.exceptions import (
@@ -56,6 +57,7 @@ def _make_stub_analyzer(client_class) -> IncidentAnalyzer:
     """Build an IncidentAnalyzer backed by an arbitrary stub LLM client."""
     return IncidentAnalyzer(
         llm_client=client_class(),
+        input_parser=InputParser(),
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         llm_retry_attempts=1,       # no retries -- tests must be deterministic
@@ -70,18 +72,18 @@ def _make_stub_analyzer(client_class) -> IncidentAnalyzer:
 def test_analyze_returns_200_with_valid_payload(valid_paygate_json):
     """A well-formed incident description must return HTTP 200 with structured JSON."""
     app.dependency_overrides[get_analyzer] = _override_analyzer([valid_paygate_json])
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/analyze",
-            json={"incident_text": (
-                "Customers complain that card payments often fail. "
-                "payment-service logs show timeouts when calling PayGate starting at 12:05 UTC. "
-                "Other services look normal."
-            )},
-        )
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                json={"incident_text": (
+                    "Customers complain that card payments often fail. "
+                    "payment-service logs show timeouts when calling PayGate starting at 12:05 UTC. "
+                    "Other services look normal."
+                )},
+            )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
@@ -98,14 +100,14 @@ def test_analyze_returns_200_with_valid_payload(valid_paygate_json):
 def test_analyze_returns_400_for_too_short_text():
     """Incident text that is too short must be rejected with HTTP 400 before hitting the LLM."""
     app.dependency_overrides[get_analyzer] = _override_analyzer([])
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/analyze",
-            json={"incident_text": "Too short"},
-        )
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                json={"incident_text": "Too short"},
+            )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 400
     assert "too short" in response.json()["detail"].lower()
@@ -129,17 +131,17 @@ def test_analyze_returns_422_when_llm_exhausts_retries():
     app.dependency_overrides[get_analyzer] = _override_analyzer(
         [always_invalid, always_invalid], max_retries=2
     )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/analyze",
-            json={"incident_text": (
-                "Sharp increase in response time for the payments endpoint "
-                "reaching up to seven seconds per request observed in logs."
-            )},
-        )
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                json={"incident_text": (
+                    "Sharp increase in response time for the payments endpoint "
+                    "reaching up to seven seconds per request observed in logs."
+                )},
+            )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 422
     body = response.json()
@@ -158,17 +160,17 @@ def test_analyze_returns_503_when_llm_unavailable():
     app.dependency_overrides[get_analyzer] = _override_with(
         _make_stub_analyzer(UnavailableLLMClient)
     )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/analyze",
-            json={"incident_text": (
-                "Mobile users cannot log in, auth-service returns 401 errors "
-                "and logs show invalid token signatures across all pods."
-            )},
-        )
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                json={"incident_text": (
+                    "Mobile users cannot log in, auth-service returns 401 errors "
+                    "and logs show invalid token signatures across all pods."
+                )},
+            )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 503
     body = response.json()
@@ -187,17 +189,17 @@ def test_analyze_returns_503_when_rate_limited():
     app.dependency_overrides[get_analyzer] = _override_with(
         _make_stub_analyzer(RateLimitClient)
     )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/analyze",
-            json={"incident_text": (
-                "Mobile users cannot log in, auth-service returns 401 errors "
-                "and logs show invalid token signatures across all pods."
-            )},
-        )
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                json={"incident_text": (
+                    "Mobile users cannot log in, auth-service returns 401 errors "
+                    "and logs show invalid token signatures across all pods."
+                )},
+            )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 503
     body = response.json()
@@ -218,23 +220,36 @@ def test_analyze_returns_500_on_auth_error():
     app.dependency_overrides[get_analyzer] = _override_with(
         _make_stub_analyzer(AuthErrorClient)
     )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/analyze",
-            json={"incident_text": (
-                "Mobile users cannot log in, auth-service returns 401 errors "
-                "and logs show invalid token signatures across all pods."
-            )},
-        )
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                json={"incident_text": (
+                    "Mobile users cannot log in, auth-service returns 401 errors "
+                    "and logs show invalid token signatures across all pods."
+                )},
+            )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 500
     body = response.json()
     assert body["code"] == "llm_configuration_error"
     # The response must NOT leak the raw API key error -- only a safe message.
     assert "misconfigured" in body["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests -- health endpoint
+# ---------------------------------------------------------------------------
+
+def test_health_endpoint_returns_200():
+    """GET /health must return 200 with status ok."""
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------

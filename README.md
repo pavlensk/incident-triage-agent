@@ -18,7 +18,8 @@ Focuses on architectural cleanliness, strict JSON data contracts, and LLM safety
    python -m venv venv
    # Windows: venv\Scripts\activate
    # Linux/Mac: source venv/bin/activate
-   pip install -r requirements.txt
+   pip install -r requirements.txt          # runtime only
+   pip install -r requirements-dev.txt      # runtime + test tools (pytest, pytest-cov)
 ```
 
 3. **Start the FastAPI server:**
@@ -121,7 +122,7 @@ pytest tests/e2e/ -v
 pytest tests/evals/ -v
 
 # Run with coverage report (requires pytest-cov)
-pytest tests/ --cov=app --cov-report=term-missing
+pytest tests/ --cov=app --cov-report=term-missing --cov-fail-under=80
 ```
 
 No API key is required to run any test.
@@ -393,6 +394,42 @@ that does not expose internal API key details to the client.
 **FastAPI Lifespan.** All initialisation (logger, LLM client, analyzer) happens inside the
 `lifespan` async context manager — not at module import time. This eliminates import-time
 side effects and makes the startup/teardown sequence explicit and testable.
+
+---
+
+## Trade-offs & Design Decisions
+
+### Keyword Retrieval vs. Vector Search
+The `ContextRetriever` uses keyword overlap (token matching) rather than vector embeddings.
+This was a deliberate trade-off: it requires zero infrastructure, has no runtime cost, and is
+fully testable offline.  The `InputParser`/`ContextRetriever` split means the keyword backend
+can be replaced with pgvector or FAISS by implementing the same `retrieve(parsed_data)` interface
+in a new class — no changes to the orchestrator or tests required.
+
+### Free-form `category` vs. Strict `Literal`
+The `category` field in `IncidentAnalysis` is a free-form `str` rather than a `Literal` over
+`TAXONOMY_CATEGORIES`.  Enforcing a strict enum would trigger unnecessary self-correction
+retries for responses that are semantically correct but phrased slightly differently.
+Category accuracy is validated separately in `tests/evals/test_taxonomy.py` using
+gold-standard fixtures, which gives the same regression coverage without imposing runtime cost.
+
+### JSON Mode vs. Function Calling
+The OpenAI `response_format={"type": "json_object"}` mode is used instead of function calling.
+JSON mode is simpler to implement, works with all GPT-4 model variants, and the explicit schema
+injected into the system prompt provides equivalent structural guarantees.  Function calling
+would add stronger type enforcement at the API level but requires a schema serialisation step
+and is harder to test offline.
+
+### In-memory Knowledge Base
+`PAST_INCIDENTS_LIST` is a static list defined in `context.py`.  For a production deployment,
+this would be replaced by a database or vector store queried at runtime.  The current design
+keeps the architecture correct (retrieval is isolated behind `ContextRetriever`) while avoiding
+operational dependencies for the proof-of-concept.
+
+### No Authentication on the API
+The `/api/v1/analyze` endpoint has no authentication layer.  In production, an API gateway or
+reverse proxy would enforce auth (API keys, OAuth2) before requests reach FastAPI.  Adding it
+directly to the FastAPI app would not change the internal architecture.
 
 ---
 

@@ -24,7 +24,7 @@ Key architectural decisions:
 import logging
 import sys
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, List
+from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from app.settings import Settings
 from app.agent.analyzer import IncidentAnalyzer
+from app.agent.input_parser import InputParser
 from app.agent.llm_client import OpenAILLMClient
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
@@ -56,7 +57,7 @@ _MIN_CHARS = 30
 
 def _setup_logging(settings: Settings) -> None:
     """Configure the root logger based on application settings."""
-    handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if settings.log_file:
         handlers.append(logging.FileHandler(settings.log_file))
     logging.basicConfig(
@@ -93,6 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.analyzer = IncidentAnalyzer(
         llm_client=llm_client,
+        input_parser=InputParser(),
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         max_retries=settings.max_retries,
@@ -192,6 +194,12 @@ class AnalyzeRequest(BaseModel):
 # Routes
 # ---------------------------------------------------------------------------
 
+@app.get("/health")
+async def health() -> dict:
+    """Liveness probe -- returns 200 when the server is running."""
+    return {"status": "ok"}
+
+
 @app.post("/api/v1/analyze")
 async def analyze_incident(
     req: AnalyzeRequest,
@@ -229,8 +237,8 @@ async def analyze_incident(
         logger.error("Unexpected error during analysis: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
-    logger.info("Incident analysed. Category: %s", result.get("category"))
-    return result
+    logger.info("Incident analysed. Category: %s", result.category)
+    return result.model_dump()
 
 
 # Mount the static frontend last so it does not shadow API routes

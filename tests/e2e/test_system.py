@@ -4,9 +4,9 @@ End-to-end system tests.
 These tests simulate the five canonical incident scenarios from the assignment,
 sending real HTTP requests through the full application stack:
 
-  HTTP POST  →  FastAPI routing  →  input validation  →  IncidentAnalyzer
-  →  ContextRetriever (real)  →  PromptBuilder (real)  →  MockLLMClient
-  →  Pydantic validation  →  HTTP 200 response
+  HTTP POST  ->  FastAPI routing  ->  input validation  ->  IncidentAnalyzer
+  ->  InputParser (real)  ->  ContextRetriever (real)  ->  PromptBuilder (real)
+  ->  MockLLMClient  ->  Pydantic validation  ->  HTTP 200 response
 
 Only the LLM call is mocked (at the protocol boundary via MockLLMClient).
 Every other component is the real production implementation, so these tests
@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app, get_analyzer
 from app.agent.analyzer import IncidentAnalyzer
+from app.agent.input_parser import InputParser
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
 from tests.conftest import MockLLMClient
@@ -34,6 +35,7 @@ def _make_e2e_analyzer(llm_response: str) -> IncidentAnalyzer:
     """Build an analyzer with a single-shot mock LLM and zero retry delay."""
     return IncidentAnalyzer(
         llm_client=MockLLMClient([llm_response]),
+        input_parser=InputParser(),
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         max_retries=1,
@@ -56,17 +58,17 @@ def test_paygate_scenario_end_to_end(paygate_llm_response):
     timeouts to PayGate.  Expected: 'External payment provider issue', high.
     """
     app.dependency_overrides[get_analyzer] = lambda: _make_e2e_analyzer(paygate_llm_response)
-
-    with TestClient(app) as client:
-        response = _post_incident(client, (
-            "Customers complain that card payments often fail, "
-            "and transactions do not go through.\n"
-            "payment-service logs show many timeouts when calling PayGate, "
-            "starting from 12:05 UTC.\n"
-            "Other services look normal."
-        ))
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = _post_incident(client, (
+                "Customers complain that card payments often fail, "
+                "and transactions do not go through.\n"
+                "payment-service logs show many timeouts when calling PayGate, "
+                "starting from 12:05 UTC.\n"
+                "Other services look normal."
+            ))
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
@@ -86,17 +88,17 @@ def test_db_saturation_scenario_end_to_end(db_saturation_llm_response):
     Expected: 'Database resource saturation', high.
     """
     app.dependency_overrides[get_analyzer] = lambda: _make_e2e_analyzer(db_saturation_llm_response)
-
-    with TestClient(app) as client:
-        response = _post_incident(client, (
-            "Sharp increase in response time for /payments/create endpoint "
-            "(up to 5-7 seconds).\n"
-            "PostgreSQL dashboards show high CPU utilization and multiple "
-            "long-running active queries from reporting-service.\n"
-            "Some clients receive 504 Gateway Timeout from api-gateway."
-        ))
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = _post_incident(client, (
+                "Sharp increase in response time for /payments/create endpoint "
+                "(up to 5-7 seconds).\n"
+                "PostgreSQL dashboards show high CPU utilization and multiple "
+                "long-running active queries from reporting-service.\n"
+                "Some clients receive 504 Gateway Timeout from api-gateway."
+            ))
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
@@ -115,16 +117,16 @@ def test_auth_failure_scenario_end_to_end(auth_failure_llm_response):
     token signatures.  Expected: 'Authentication token failure', high.
     """
     app.dependency_overrides[get_analyzer] = lambda: _make_e2e_analyzer(auth_failure_llm_response)
-
-    with TestClient(app) as client:
-        response = _post_incident(client, (
-            "Mobile application users report consistent login failures.\n"
-            "auth-service logs show an explicit spike in 401 Unauthorized responses.\n"
-            "Internal log messages indicate invalid token signatures "
-            "while other services function normally."
-        ))
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = _post_incident(client, (
+                "Mobile application users report consistent login failures.\n"
+                "auth-service logs show an explicit spike in 401 Unauthorized responses.\n"
+                "Internal log messages indicate invalid token signatures "
+                "while other services function normally."
+            ))
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
@@ -143,17 +145,17 @@ def test_smtp_degradation_scenario_end_to_end(smtp_degradation_llm_response):
     Expected: 'Notification delivery degradation', low (financial ops intact).
     """
     app.dependency_overrides[get_analyzer] = lambda: _make_e2e_analyzer(smtp_degradation_llm_response)
-
-    with TestClient(app) as client:
-        response = _post_incident(client, (
-            "Users report they are not receiving top-up confirmation emails.\n"
-            "Financial balances are credited successfully and billing records "
-            "are completely correct.\n"
-            "notification-service logs display intermittent connection timeouts "
-            "to the external SMTP provider."
-        ))
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = _post_incident(client, (
+                "Users report they are not receiving top-up confirmation emails.\n"
+                "Financial balances are credited successfully and billing records "
+                "are completely correct.\n"
+                "notification-service logs display intermittent connection timeouts "
+                "to the external SMTP provider."
+            ))
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
@@ -172,18 +174,18 @@ def test_compound_degradation_scenario_end_to_end(compound_degradation_llm_respo
     Expected: 'Compound infrastructure degradation', high, multiple hypotheses.
     """
     app.dependency_overrides[get_analyzer] = lambda: _make_e2e_analyzer(compound_degradation_llm_response)
-
-    with TestClient(app) as client:
-        response = _post_incident(client, (
-            "System performance dashboard shows payments are slow "
-            "(averaging 5 seconds per request).\n"
-            "Simultaneously, customer support reports users are not receiving "
-            "SMS confirmations.\n"
-            "Logs show severe reporting-service load on the primary DB "
-            "concurrent with network timeout errors to external SMS gateways."
-        ))
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = _post_incident(client, (
+                "System performance dashboard shows payments are slow "
+                "(averaging 5 seconds per request).\n"
+                "Simultaneously, customer support reports users are not receiving "
+                "SMS confirmations.\n"
+                "Logs show severe reporting-service load on the primary DB "
+                "concurrent with network timeout errors to external SMS gateways."
+            ))
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
@@ -193,7 +195,7 @@ def test_compound_degradation_scenario_end_to_end(compound_degradation_llm_respo
 
 
 # ---------------------------------------------------------------------------
-# Scenario 6: Input validation guard (too short → no LLM call)
+# Scenario 6: Input validation guard (too short -> no LLM call)
 # ---------------------------------------------------------------------------
 
 def test_short_input_rejected_before_pipeline():
@@ -211,14 +213,15 @@ def test_short_input_rejected_before_pipeline():
 
     app.dependency_overrides[get_analyzer] = lambda: IncidentAnalyzer(
         llm_client=CountingClient(),
+        input_parser=InputParser(),
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
     )
-
-    with TestClient(app) as client:
-        response = client.post("/api/v1/analyze", json={"incident_text": "Too short"})
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/v1/analyze", json={"incident_text": "Too short"})
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 400
     assert call_count == 0, "LLM must not be called for rejected inputs"
@@ -238,23 +241,24 @@ def test_self_correction_loop_end_to_end(minimal_valid_json):
 
     app.dependency_overrides[get_analyzer] = lambda: IncidentAnalyzer(
         llm_client=MockLLMClient([invalid_first, minimal_valid_json]),
+        input_parser=InputParser(),
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         max_retries=2,
         llm_retry_attempts=1,
         llm_retry_delay_seconds=0.0,
     )
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/v1/analyze",
-            json={"incident_text": (
-                "Sharp increase in response time for /payments/create endpoint "
-                "reaching up to seven seconds per request in production logs."
-            )},
-        )
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/analyze",
+                json={"incident_text": (
+                    "Sharp increase in response time for /payments/create endpoint "
+                    "reaching up to seven seconds per request in production logs."
+                )},
+            )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     assert response.json()["category"] == "DB degradation"

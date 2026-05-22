@@ -42,36 +42,36 @@ class TestSeverityRubricAdherence:
     """
 
     def test_paygate_is_high(self, eval_paygate_response):
-        """Mass payment failures → high."""
+        """Mass payment failures -> high."""
         result = _parse(eval_paygate_response)
         assert result.severity == "high", (
             "PayGate outage blocks core financial operations -- must be 'high'"
         )
 
     def test_db_saturation_is_high(self, eval_db_saturation_response):
-        """DB saturation with cascading payment timeouts → high."""
+        """DB saturation with cascading payment timeouts -> high."""
         result = _parse(eval_db_saturation_response)
         assert result.severity == "high"
 
     def test_auth_failure_is_high(self, eval_auth_failure_response):
-        """Authentication fully blocked → high."""
+        """Authentication fully blocked -> high."""
         result = _parse(eval_auth_failure_response)
         assert result.severity == "high"
 
     def test_smtp_degradation_is_low(self, eval_notification_degradation_response):
-        """Financial operations intact, only notification delayed → low."""
+        """Financial operations intact, only notification delayed -> low."""
         result = _parse(eval_notification_degradation_response)
         assert result.severity == "low", (
             "Delayed notification with intact billing must be 'low' per rubric"
         )
 
     def test_compound_degradation_is_high(self, eval_compound_degradation_response):
-        """Payment processing affected → high regardless of secondary issues."""
+        """Payment processing affected -> high regardless of secondary issues."""
         result = _parse(eval_compound_degradation_response)
         assert result.severity == "high"
 
     def test_network_routing_is_medium(self, eval_network_routing_response):
-        """Intermittent degradation without full blockage → medium."""
+        """Intermittent degradation without full blockage -> medium."""
         result = _parse(eval_network_routing_response)
         assert result.severity == "medium"
 
@@ -100,7 +100,7 @@ class TestSeverityValidation:
             "Users are not receiving confirmation emails after top-up. "
             "Billing records are correct and all payments succeed normally."
         )
-        assert result["severity"] == severity
+        assert result.severity == severity
 
     def test_invalid_severity_rejected_by_schema(self):
         """

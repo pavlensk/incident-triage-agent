@@ -5,7 +5,7 @@ Extracted into a dedicated module so that PromptBuilder (schema injection),
 IncidentAnalyzer (response validation), and the API layer can all import
 from a single authoritative source.
 """
-from typing import List, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +19,7 @@ class Hypothesis(BaseModel):
     reasoning: str = Field(
         ..., min_length=10, description="Reasoning based strictly on logs and architecture"
     )
-    next_steps: List[str] = Field(
+    next_steps: list[str] = Field(
         ..., min_length=2, max_length=3, description="2-3 concrete diagnostic steps"
     )
 
@@ -27,6 +27,12 @@ class Hypothesis(BaseModel):
 class IncidentAnalysis(BaseModel):
     """Complete structured result of an incident analysis."""
 
+    # Design decision: 'category' is a free-form string rather than a strict
+    # Literal over TAXONOMY_CATEGORIES.  The LLM may return semantically
+    # equivalent phrases that differ slightly from the canonical labels.
+    # Enforcing a Literal here would cause unnecessary self-correction retries
+    # for responses that are otherwise correct.  Category accuracy is validated
+    # separately in tests/evals/test_taxonomy.py using gold-standard fixtures.
     category: str = Field(
         ..., min_length=3, description="Incident classification category"
     )
@@ -42,6 +48,6 @@ class IncidentAnalysis(BaseModel):
     summary: str = Field(
         ..., min_length=10, description="Short summary of what is happening"
     )
-    hypotheses: List[Hypothesis] = Field(
+    hypotheses: list[Hypothesis] = Field(
         ..., min_length=1, max_length=3, description="Up to 3 hypotheses"
     )

@@ -19,7 +19,7 @@ never depends on openai internals:
   None / empty response content       -> LLMUnavailableError
 """
 import logging
-from typing import List, Dict, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import openai
 from openai import AsyncOpenAI
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 class LLMClientProtocol(Protocol):
     """Minimal interface that any LLM client must satisfy."""
 
-    async def complete(self, messages: List[Dict[str, str]]) -> str:
+    async def complete(self, messages: list[dict[str, str]]) -> str:
         """Send a list of messages and return the model's response text."""
         ...
 
@@ -53,7 +53,7 @@ class OpenAILLMClient:
     model_name :
         Chat model identifier (e.g. ``"gpt-4o-mini"``).
     temperature :
-        Sampling temperature (0.0 – 2.0).
+        Sampling temperature (0.0 - 2.0).
     timeout :
         Per-request HTTP timeout in seconds.  Prevents hung requests from
         blocking the event loop indefinitely.
@@ -70,7 +70,7 @@ class OpenAILLMClient:
         self._model_name = model_name
         self._temperature = temperature
 
-    async def complete(self, messages: List[Dict[str, str]]) -> str:
+    async def complete(self, messages: list[dict[str, str]]) -> str:
         """
         Call Chat Completions and return the response text.
 

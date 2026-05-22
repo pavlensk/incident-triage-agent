@@ -2,7 +2,7 @@
 IncidentAnalyzer -- pipeline orchestrator for incident analysis.
 
 Single responsibility: coordinate four stages:
-  1. Input text parsing                (ContextRetriever.parse_input)
+  1. Input text parsing                (InputParser.parse_input)
   2. Relevant context retrieval        (ContextRetriever.retrieve)
   3. Prompt assembly                   (PromptBuilder.build_system_prompt)
   4. LLM call + self-correction loop   (LLMClientProtocol + Pydantic)
@@ -23,12 +23,12 @@ making this component fully testable without a real API key.
 """
 import asyncio
 import logging
-from typing import Dict, Any
 
 from pydantic import ValidationError
 
 from app.schemas import IncidentAnalysis
 from app.agent.llm_client import LLMClientProtocol
+from app.agent.input_parser import InputParser
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
 from app.agent.exceptions import (
@@ -49,8 +49,10 @@ class IncidentAnalyzer:
     llm_client :
         Any object satisfying LLMClientProtocol.
         Use MockLLMClient in tests, OpenAILLMClient in production.
+    input_parser :
+        Component responsible for input normalisation and keyword extraction.
     retriever :
-        Component responsible for input parsing and context retrieval.
+        Component responsible for context retrieval.
     prompt_builder :
         Component responsible for prompt assembly.
     max_retries :
@@ -65,6 +67,7 @@ class IncidentAnalyzer:
     def __init__(
         self,
         llm_client: LLMClientProtocol,
+        input_parser: InputParser,
         retriever: ContextRetriever,
         prompt_builder: PromptBuilder,
         max_retries: int = 3,
@@ -72,6 +75,7 @@ class IncidentAnalyzer:
         llm_retry_delay_seconds: float = 1.0,
     ) -> None:
         self._llm = llm_client
+        self._input_parser = input_parser
         self._retriever = retriever
         self._prompt_builder = prompt_builder
         self._max_retries = max_retries
@@ -115,11 +119,11 @@ class IncidentAnalyzer:
     # Public API
     # ------------------------------------------------------------------
 
-    async def analyze(self, user_input: str) -> Dict[str, Any]:
+    async def analyze(self, user_input: str) -> IncidentAnalysis:
         """
         Run the full incident analysis pipeline.
 
-        Returns a dict conforming to the IncidentAnalysis schema.
+        Returns a validated IncidentAnalysis instance.
 
         Raises
         ------
@@ -131,7 +135,7 @@ class IncidentAnalyzer:
             When schema validation fails on every attempt of the correction loop.
         """
         # Stage 1: parse input text
-        parsed = self._retriever.parse_input(user_input)
+        parsed = self._input_parser.parse_input(user_input)
 
         # Stage 2: retrieve relevant past incidents
         context = self._retriever.retrieve(parsed)
@@ -153,7 +157,7 @@ class IncidentAnalyzer:
             try:
                 result = IncidentAnalysis.model_validate_json(raw_response)
                 logger.info("Analysis completed successfully (attempt %d).", attempt)
-                return result.model_dump()
+                return result
 
             except ValidationError as exc:
                 logger.warning(

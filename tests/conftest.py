@@ -9,6 +9,7 @@ import json
 import pytest
 
 from app.agent.analyzer import IncidentAnalyzer
+from app.agent.input_parser import InputParser
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
 
@@ -105,6 +106,7 @@ def make_analyzer(
     """
     return IncidentAnalyzer(
         llm_client=MockLLMClient(responses),
+        input_parser=InputParser(),
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         max_retries=max_retries,
