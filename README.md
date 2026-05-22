@@ -34,15 +34,97 @@ Focuses on architectural cleanliness, strict JSON data contracts, and LLM safety
 
 ## Testing
 
-The project includes pytest tests covering the LLM retry logic, Pydantic validation,
-context retrieval, and prompt assembly — all with a deterministic `MockLLMClient` stub
-(no real API calls required).
+### Testing Strategy
 
-Run the test suite via:
+The test suite is organized into four layers.  Each layer has a distinct scope
+and purpose; together they provide coverage of correctness, reliability, and
+output quality without requiring a real OpenAI API key.
+
+| Layer | Location | Purpose |
+|-------|----------|---------|
+| **Unit** | `tests/unit/` + `tests/test_agent.py` | Isolated components — no I/O, no HTTP |
+| **Integration** | `tests/test_api.py` | HTTP layer wiring — TestClient + DI overrides |
+| **End-to-End** | `tests/e2e/` | Full scenarios — HTTP → pipeline → response |
+| **Evaluations** | `tests/evals/` | Output quality — taxonomy, severity, retrieval |
+
+#### Unit tests (`tests/unit/`, `tests/test_agent.py`)
+
+Test individual classes and functions in isolation.  The LLM is replaced by
+`MockLLMClient` — a deterministic stub that returns pre-set strings — so there
+are no network calls, no API keys, and no flakiness.
+
+Covered:
+- `test_schemas.py` — every Pydantic field constraint at its boundary value
+  (min/max length, literal enum, list size).
+- `test_exceptions.py` — inheritance chain and catch-at-right-level behaviour.
+- `test_agent.py` — `IncidentAnalyzer` pipeline stages, schema-validation retry
+  loop, rate-limit exponential backoff, auth-error propagation.
+- Retriever keyword extraction and stop-word filtering.
+- `PromptBuilder` system prompt and self-correction message content.
+
+#### Integration tests (`tests/test_api.py`)
+
+Test the HTTP layer end-to-end using FastAPI's `TestClient`.
+`app.dependency_overrides` replaces the real `IncidentAnalyzer` with a
+mock-backed version so tests are still offline and deterministic.
+
+Covered:
+- HTTP 200 with valid payload and structured JSON response.
+- HTTP 400 for too-short incident text (rejected before LLM call).
+- HTTP 422 for missing request body field (Pydantic) and for LLM
+  exhausting all validation retries.
+- HTTP 503 for transient LLM unavailability and rate-limit errors.
+- HTTP 500 for authentication failures (server misconfiguration).
+- Structured error response format `{"code": "...", "message": "..."}`.
+- Static frontend served at root `/`.
+
+#### End-to-End tests (`tests/e2e/`)
+
+Simulate realistic user interactions with the full application stack.
+Only the LLM call is mocked (via `MockLLMClient`); every other component
+— routing, retriever, prompt builder, Pydantic validation — is the real
+production implementation.
+
+Covered:
+- All five canonical incident scenarios from the assignment specification.
+- Verify the 400 guard fires before the pipeline is entered.
+- Verify the self-correction loop is transparent to the HTTP caller (still 200).
+
+Gold-standard LLM responses live in `tests/e2e/conftest.py`.
+
+#### Evaluation tests (`tests/evals/`)
+
+Evaluate the *quality* of the system's output, not just its mechanical
+correctness.  Evals answer: "Does the system produce the right answer for
+known inputs?"
+
+| File | What it evaluates |
+|------|-------------------|
+| `test_taxonomy.py` | Category accuracy for all 6 taxonomy entries |
+| `test_severity.py` | Severity rubric adherence (high/medium/low) |
+| `test_retrieval.py` | Retriever precision, recall, fallback, keyword extraction |
+
+Gold-standard LLM responses per category live in `tests/evals/conftest.py`.
+To add a new eval scenario: add a fixture there and a parametrize row in
+the relevant test file — no other changes required.
+
+### Running Tests
 
 ```bash
+# Run the entire suite
 pytest tests/ -v
+
+# Run a single layer
+pytest tests/unit/ -v
+pytest tests/test_api.py -v
+pytest tests/e2e/ -v
+pytest tests/evals/ -v
+
+# Run with coverage report (requires pytest-cov)
+pytest tests/ --cov=app --cov-report=term-missing
 ```
+
+No API key is required to run any test.
 
 ### Manual Test Cases & Expected Outputs
 
