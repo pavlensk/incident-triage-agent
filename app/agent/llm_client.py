@@ -65,8 +65,16 @@ class OpenAILLMClient:
         model_name: str,
         temperature: float,
         timeout: float = 30.0,
+        base_url: str | None = None,
     ) -> None:
-        self._client = AsyncOpenAI(api_key=api_key, timeout=timeout)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            timeout=timeout,
+            # base_url=None lets the SDK use its default (api.openai.com).
+            # A non-None value redirects all requests -- useful for corporate
+            # proxies, Azure OpenAI, or local model servers (LiteLLM, Ollama).
+            **({"base_url": base_url} if base_url is not None else {}),
+        )
         self._model_name = model_name
         self._temperature = temperature
 

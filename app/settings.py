@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # --- LLM: schema-validation retry loop ---
     openai_api_key: str = "dummy_key"
+    openai_base_url: str | None = None   # override for corporate proxies / Azure OpenAI
     llm_model_name: str = "gpt-4o-mini"
     llm_temperature: float = 0.1
     max_retries: int = 3          # max attempts to get a schema-valid response

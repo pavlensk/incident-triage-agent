@@ -50,9 +50,18 @@ def _make_timeout_error() -> openai.APITimeoutError:
 
 
 def _make_openai_response(content: str | None) -> MagicMock:
-    """Return a mock that mirrors response.choices[0].message.content."""
+    """
+    Return a mock that mirrors response.choices[0].message.content.
+
+    choices is an explicit list so the mock accurately reflects the SDK's
+    structure -- mock.choices[0] via __getitem__ on an auto-created MagicMock
+    would work today but wouldn't express intent and could silently diverge
+    from the real SDK shape if the attribute access pattern ever changed.
+    """
+    choice = MagicMock()
+    choice.message.content = content
     mock = MagicMock()
-    mock.choices[0].message.content = content
+    mock.choices = [choice]
     return mock
 
 
@@ -287,4 +296,64 @@ class TestOwnExceptionPassthrough:
         assert "empty" in message.lower(), (
             "The original 'empty response content' message must survive the "
             "re-raise guard unchanged."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Class 4: base_url forwarding
+# ---------------------------------------------------------------------------
+
+class TestBaseUrlForwarding:
+    """
+    OpenAILLMClient must forward the base_url parameter to AsyncOpenAI so that
+    corporate proxies, Azure OpenAI endpoints, and local model servers
+    (LiteLLM, Ollama) work without any changes to the client code.
+
+    Two cases are verified:
+      - base_url=None  -> AsyncOpenAI is called WITHOUT a base_url kwarg
+                          (the SDK uses its own default: api.openai.com).
+      - base_url=<url> -> AsyncOpenAI is called WITH the exact url supplied.
+
+    Passing None explicitly would override the SDK default in some versions,
+    so the implementation uses conditional kwargs unpacking.
+    """
+
+    def test_base_url_is_forwarded_when_provided(self):
+        """
+        When base_url is supplied, AsyncOpenAI must receive it as a keyword
+        argument.  This is the critical path for proxy / Azure deployments.
+        """
+        proxy_url = "https://my-corp-proxy.example.com/openai/v1"
+        with patch("app.agent.llm_client.AsyncOpenAI") as MockOpenAI:
+            MockOpenAI.return_value = MagicMock()
+            OpenAILLMClient(
+                api_key="test-key",
+                model_name="gpt-4o-mini",
+                temperature=0.0,
+                base_url=proxy_url,
+            )
+        _, kwargs = MockOpenAI.call_args
+        assert kwargs.get("base_url") == proxy_url, (
+            f"AsyncOpenAI was not called with base_url={proxy_url!r}. "
+            f"Actual kwargs: {kwargs}"
+        )
+
+    def test_base_url_is_absent_when_not_provided(self):
+        """
+        When base_url is None (the default), AsyncOpenAI must NOT receive a
+        base_url kwarg at all -- passing None explicitly could override the
+        SDK's built-in default in some SDK versions.
+        """
+        with patch("app.agent.llm_client.AsyncOpenAI") as MockOpenAI:
+            MockOpenAI.return_value = MagicMock()
+            OpenAILLMClient(
+                api_key="test-key",
+                model_name="gpt-4o-mini",
+                temperature=0.0,
+                # base_url intentionally omitted (defaults to None)
+            )
+        _, kwargs = MockOpenAI.call_args
+        assert "base_url" not in kwargs, (
+            "AsyncOpenAI must not receive base_url when it was not specified -- "
+            f"got base_url={kwargs.get('base_url')!r} in kwargs."
         )

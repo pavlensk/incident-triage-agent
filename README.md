@@ -323,7 +323,8 @@ tests/
   unit/
     test_schemas.py     — Pydantic field constraints at boundary values
     test_exceptions.py  — Domain exception hierarchy and catch-at-right-level behaviour
-    test_llm_client.py  — OpenAILLMClient: SDK exception mapping, content guards, passthrough
+    test_llm_client.py    — OpenAILLMClient: SDK exception mapping, content guards, passthrough
+    test_input_parser.py  — InputParser: keyword extraction, stop-word filtering, hyphen normalisation, edge cases
   e2e/
     test_system.py  — Five canonical incident scenarios through the full stack
   evals/
@@ -447,6 +448,14 @@ operational dependencies for the proof-of-concept.
 The `/api/v1/analyze` endpoint has no authentication layer.  In production, an API gateway or
 reverse proxy would enforce auth (API keys, OAuth2) before requests reach FastAPI.  Adding it
 directly to the FastAPI app would not change the internal architecture.
+
+### `dict[str, Any]` vs. `@dataclass ParsedInput` for Pipeline Data Transfer
+`InputParser.parse_input()` returns `dict[str, Any]` (keys `raw_text` and `keywords`) rather than
+a typed `@dataclass ParsedInput(raw_text: str, keywords: list[str])`.  A dataclass would make the
+Stage 1 → Stage 2 interface explicit and catch key-name typos at write time rather than at runtime.
+The plain dict was chosen to keep the interface minimal for a proof-of-concept; promoting it to a
+`ParsedInput` dataclass is a low-risk, high-readability improvement for a production codebase and
+would not require any changes to the orchestrator or retrieval logic.
 
 ---
 

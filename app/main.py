@@ -91,6 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_name=settings.llm_model_name,
         temperature=settings.llm_temperature,
         timeout=settings.llm_timeout_seconds,
+        base_url=settings.openai_base_url,
     )
     app.state.analyzer = IncidentAnalyzer(
         llm_client=llm_client,
@@ -250,3 +251,4 @@ if __name__ == "__main__":
 
     _settings = Settings()
     uvicorn.run(app, host=_settings.host, port=_settings.port)
+ host=_settings.host, port=_settings.port)
