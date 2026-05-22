@@ -251,4 +251,3 @@ if __name__ == "__main__":
 
     _settings = Settings()
     uvicorn.run(app, host=_settings.host, port=_settings.port)
- host=_settings.host, port=_settings.port)
