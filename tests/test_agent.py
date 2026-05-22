@@ -12,12 +12,17 @@ import pytest
 from app.agent.analyzer import IncidentAnalyzer
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
-from app.agent.exceptions import LLMInvalidResponseError
+from app.agent.exceptions import (
+    LLMAuthenticationError,
+    LLMInvalidResponseError,
+    LLMRateLimitError,
+    LLMUnavailableError,
+)
 from tests.conftest import MockLLMClient, make_analyzer
 
 
 # ---------------------------------------------------------------------------
-# Unit tests -- agent pipeline
+# Unit tests -- agent pipeline (happy path + validation retry)
 # ---------------------------------------------------------------------------
 
 async def test_happy_path_canonical_example(valid_paygate_json):
@@ -57,6 +62,8 @@ async def test_retry_on_invalid_json(minimal_valid_json):
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         max_retries=2,
+        llm_retry_attempts=1,
+        llm_retry_delay_seconds=0.0,
     )
 
     result = await analyzer.analyze(incident_text)
@@ -74,6 +81,106 @@ async def test_failure_after_max_retries():
 
     with pytest.raises(LLMInvalidResponseError, match="Failed to generate a valid response"):
         await analyzer.analyze(incident_text)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests -- LLM-level retry (rate limit backoff)
+# ---------------------------------------------------------------------------
+
+async def test_rate_limit_retry_succeeds(valid_paygate_json):
+    """
+    Rate limit on the first LLM call, success on retry.
+
+    Verifies that the exponential-backoff retry in _call_llm() fires and
+    that the overall analysis still succeeds.
+    """
+    incident_text = (
+        "Customers cannot pay by card, payment-service logs show timeouts "
+        "when calling PayGate starting at 14:00 UTC."
+    )
+
+    call_count = 0
+
+    class RateLimitThenSuccessClient:
+        async def complete(self, messages: list) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise LLMRateLimitError("Rate limited on first attempt")
+            return valid_paygate_json
+
+    analyzer = IncidentAnalyzer(
+        llm_client=RateLimitThenSuccessClient(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        llm_retry_attempts=2,
+        llm_retry_delay_seconds=0.0,  # no real sleep in tests
+    )
+
+    result = await analyzer.analyze(incident_text)
+
+    assert result["category"] == "External payment provider issue"
+    assert call_count == 2, "LLM should have been called exactly twice (1 rate-limited + 1 success)"
+
+
+async def test_rate_limit_exhausted_raises():
+    """
+    Rate limit on every attempt: LLMRateLimitError must propagate after all
+    retries are exhausted.  Since LLMRateLimitError IS-A LLMUnavailableError,
+    catching either class works.
+    """
+    incident_text = (
+        "Customers cannot pay by card, payment-service logs show timeouts "
+        "when calling PayGate starting at 14:00 UTC."
+    )
+
+    class AlwaysRateLimitClient:
+        async def complete(self, messages: list) -> str:
+            raise LLMRateLimitError("Always rate limited")
+
+    analyzer = IncidentAnalyzer(
+        llm_client=AlwaysRateLimitClient(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        llm_retry_attempts=2,
+        llm_retry_delay_seconds=0.0,
+    )
+
+    # LLMRateLimitError inherits from LLMUnavailableError
+    with pytest.raises(LLMUnavailableError):
+        await analyzer.analyze(incident_text)
+
+
+async def test_auth_error_propagates_immediately():
+    """
+    Authentication errors must propagate immediately without any retry,
+    because retrying with a bad API key will never succeed.
+    """
+    incident_text = (
+        "Customers cannot pay by card, payment-service logs show timeouts "
+        "when calling PayGate starting at 14:00 UTC."
+    )
+
+    call_count = 0
+
+    class AuthErrorClient:
+        async def complete(self, messages: list) -> str:
+            nonlocal call_count
+            call_count += 1
+            raise LLMAuthenticationError("Invalid API key")
+
+    analyzer = IncidentAnalyzer(
+        llm_client=AuthErrorClient(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        llm_retry_attempts=3,       # high retry count -- should NOT be used
+        llm_retry_delay_seconds=0.0,
+    )
+
+    with pytest.raises(LLMAuthenticationError):
+        await analyzer.analyze(incident_text)
+
+    assert call_count == 1, "Authentication error must not trigger any retry"
 
 
 # ---------------------------------------------------------------------------

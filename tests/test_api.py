@@ -1,9 +1,15 @@
 """
 Integration tests for the FastAPI HTTP layer.
 
-Uses FastAPI's TestClient with dependency_overrides to inject a MockLLMClient,
+Uses FastAPI's TestClient with dependency_overrides to inject mock LLM clients,
 so tests remain offline and deterministic while covering the full HTTP stack:
-routing, request validation, response codes, and error mapping.
+routing, request validation, response codes, error mapping, and response format.
+
+Error response format for domain exceptions:
+    {"code": "<machine_readable>", "message": "<human_readable>"}
+
+HTTPException responses (400 / Pydantic 422) keep FastAPI's default format:
+    {"detail": "..."}
 """
 import json
 
@@ -11,7 +17,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app, get_analyzer
-from app.agent.exceptions import LLMUnavailableError
+from app.agent.analyzer import IncidentAnalyzer
+from app.agent.retriever import ContextRetriever
+from app.agent.prompt_builder import PromptBuilder
+from app.agent.exceptions import (
+    LLMAuthenticationError,
+    LLMRateLimitError,
+    LLMUnavailableError,
+)
 from tests.conftest import MockLLMClient, make_analyzer
 
 
@@ -34,8 +47,24 @@ def _override_analyzer(responses: list, max_retries: int = 3):
     return _get
 
 
+def _override_with(analyzer: IncidentAnalyzer):
+    """Return a dependency override that returns a pre-built analyzer."""
+    return lambda: analyzer
+
+
+def _make_stub_analyzer(client_class) -> IncidentAnalyzer:
+    """Build an IncidentAnalyzer backed by an arbitrary stub LLM client."""
+    return IncidentAnalyzer(
+        llm_client=client_class(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        llm_retry_attempts=1,       # no retries -- tests must be deterministic
+        llm_retry_delay_seconds=0.0,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Integration tests
+# Integration tests -- success path
 # ---------------------------------------------------------------------------
 
 def test_analyze_returns_200_with_valid_payload(valid_paygate_json):
@@ -62,6 +91,10 @@ def test_analyze_returns_200_with_valid_payload(valid_paygate_json):
     assert len(body["hypotheses"]) >= 1
 
 
+# ---------------------------------------------------------------------------
+# Integration tests -- input validation errors
+# ---------------------------------------------------------------------------
+
 def test_analyze_returns_400_for_too_short_text():
     """Incident text that is too short must be rejected with HTTP 400 before hitting the LLM."""
     app.dependency_overrides[get_analyzer] = _override_analyzer([])
@@ -77,6 +110,18 @@ def test_analyze_returns_400_for_too_short_text():
     assert response.status_code == 400
     assert "too short" in response.json()["detail"].lower()
 
+
+def test_analyze_returns_422_for_missing_body_field():
+    """A request missing the required incident_text field must return HTTP 422 (Pydantic)."""
+    with TestClient(app) as client:
+        response = client.post("/api/v1/analyze", json={})
+
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Integration tests -- domain exception -> HTTP code mapping
+# ---------------------------------------------------------------------------
 
 def test_analyze_returns_422_when_llm_exhausts_retries():
     """When the LLM returns invalid JSON on all retries, the API must respond with HTTP 422."""
@@ -97,6 +142,9 @@ def test_analyze_returns_422_when_llm_exhausts_retries():
     app.dependency_overrides.clear()
 
     assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "llm_invalid_response"
+    assert "message" in body
 
 
 def test_analyze_returns_503_when_llm_unavailable():
@@ -107,16 +155,9 @@ def test_analyze_returns_503_when_llm_unavailable():
         async def complete(self, messages: list) -> str:
             raise LLMUnavailableError("Connection refused")
 
-    from app.agent.analyzer import IncidentAnalyzer
-    from app.agent.retriever import ContextRetriever
-    from app.agent.prompt_builder import PromptBuilder
-
-    unavailable_analyzer = IncidentAnalyzer(
-        llm_client=UnavailableLLMClient(),
-        retriever=ContextRetriever(),
-        prompt_builder=PromptBuilder(),
+    app.dependency_overrides[get_analyzer] = _override_with(
+        _make_stub_analyzer(UnavailableLLMClient)
     )
-    app.dependency_overrides[get_analyzer] = lambda: unavailable_analyzer
 
     with TestClient(app) as client:
         response = client.post(
@@ -130,15 +171,75 @@ def test_analyze_returns_503_when_llm_unavailable():
     app.dependency_overrides.clear()
 
     assert response.status_code == 503
+    body = response.json()
+    assert body["code"] == "llm_unavailable"
+    assert "message" in body
 
 
-def test_analyze_returns_422_for_missing_body_field():
-    """A request missing the required incident_text field must return HTTP 422 (Pydantic)."""
+def test_analyze_returns_503_when_rate_limited():
+    """Rate-limit errors must surface as HTTP 503 (LLMRateLimitError IS-A LLMUnavailableError)."""
+
+    class RateLimitClient:
+        """Stub that always raises LLMRateLimitError."""
+        async def complete(self, messages: list) -> str:
+            raise LLMRateLimitError("Rate limit exceeded")
+
+    app.dependency_overrides[get_analyzer] = _override_with(
+        _make_stub_analyzer(RateLimitClient)
+    )
+
     with TestClient(app) as client:
-        response = client.post("/api/v1/analyze", json={})
+        response = client.post(
+            "/api/v1/analyze",
+            json={"incident_text": (
+                "Mobile users cannot log in, auth-service returns 401 errors "
+                "and logs show invalid token signatures across all pods."
+            )},
+        )
 
-    assert response.status_code == 422
+    app.dependency_overrides.clear()
 
+    assert response.status_code == 503
+    body = response.json()
+    assert body["code"] == "llm_unavailable"
+
+
+def test_analyze_returns_500_on_auth_error():
+    """
+    An invalid / revoked API key must return HTTP 500 with a safe, non-leaking
+    message -- it is a server-side configuration problem, not a client error.
+    """
+
+    class AuthErrorClient:
+        """Stub that always raises LLMAuthenticationError."""
+        async def complete(self, messages: list) -> str:
+            raise LLMAuthenticationError("Invalid API key")
+
+    app.dependency_overrides[get_analyzer] = _override_with(
+        _make_stub_analyzer(AuthErrorClient)
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/analyze",
+            json={"incident_text": (
+                "Mobile users cannot log in, auth-service returns 401 errors "
+                "and logs show invalid token signatures across all pods."
+            )},
+        )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["code"] == "llm_configuration_error"
+    # The response must NOT leak the raw API key error -- only a safe message.
+    assert "misconfigured" in body["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests -- static frontend
+# ---------------------------------------------------------------------------
 
 def test_static_frontend_is_served():
     """The root path must serve the static HTML frontend."""

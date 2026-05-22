@@ -2,16 +2,24 @@
 FastAPI application entry point.
 
 Key architectural decisions:
-  - lifespan context manager instead of module-level global code:
-    resource initialisation and cleanup happen explicitly at startup/shutdown.
-  - Settings are read from the centralised Settings object once at startup.
-  - IncidentAnalyzer is created inside lifespan and stored in app.state,
-    making the dependency explicit and allowing overrides in tests.
-  - Typed exceptions (LLMUnavailableError / LLMInvalidResponseError) are
-    translated into precise HTTP status codes (503 / 422).
-  - Short-text validation raises HTTPException(400) explicitly in the route
-    rather than via Pydantic field_validator -- this preserves the correct
-    HTTP 400 (Bad Request) semantic, distinct from 422 (Unprocessable Entity).
+  - lifespan context manager: resources are initialised and released
+    explicitly at startup/shutdown, not at module import time.
+  - Settings object is the single source of configuration truth; no
+    os.getenv() calls in business logic.
+  - IncidentAnalyzer is stored in app.state and injected via get_analyzer()
+    dependency -- easy to override in tests.
+  - All domain exceptions are mapped to HTTP status codes by registered
+    global exception handlers, so route handlers stay thin:
+
+      LLMAuthenticationError   -> 500  (server misconfiguration)
+      LLMUnavailableError      -> 503  (transient service error)
+      LLMRateLimitError        -> 503  (inherits LLMUnavailableError)
+      LLMInvalidResponseError  -> 422  (LLM could not produce valid output)
+
+  - Error responses have a consistent JSON structure:
+      {"code": "<machine_readable>", "message": "<human_readable>"}
+    HTTPException (400 / 422 validation) keeps FastAPI's default format
+      {"detail": "..."} for compatibility with standard tooling.
 """
 import logging
 import sys
@@ -19,6 +27,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, List
 
 from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -27,7 +36,11 @@ from app.agent.analyzer import IncidentAnalyzer
 from app.agent.llm_client import OpenAILLMClient
 from app.agent.retriever import ContextRetriever
 from app.agent.prompt_builder import PromptBuilder
-from app.agent.exceptions import LLMUnavailableError, LLMInvalidResponseError
+from app.agent.exceptions import (
+    LLMAuthenticationError,
+    LLMInvalidResponseError,
+    LLMUnavailableError,
+)
 
 # Module-level logger: created once, reused on every request.
 logger = logging.getLogger(__name__)
@@ -76,12 +89,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         api_key=settings.openai_api_key,
         model_name=settings.llm_model_name,
         temperature=settings.llm_temperature,
+        timeout=settings.llm_timeout_seconds,
     )
     app.state.analyzer = IncidentAnalyzer(
         llm_client=llm_client,
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         max_retries=settings.max_retries,
+        llm_retry_attempts=settings.llm_retry_attempts,
+        llm_retry_delay_seconds=settings.llm_retry_delay_seconds,
     )
     logger.info("IncidentAnalyzer initialised (model: %s).", settings.llm_model_name)
 
@@ -91,11 +107,72 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 # ---------------------------------------------------------------------------
-# Application and routes
+# Application
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="AI Incident Triage API", lifespan=lifespan)
 
+
+# ---------------------------------------------------------------------------
+# Global exception handlers
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(LLMAuthenticationError)
+async def llm_auth_error_handler(
+    request: Request, exc: LLMAuthenticationError
+) -> JSONResponse:
+    """
+    Authentication failures indicate a server-side configuration problem
+    (wrong or revoked API key).  Return 500 with a safe, non-leaking message.
+    """
+    logger.critical(
+        "LLM authentication failure -- check OPENAI_API_KEY. Detail: %s", exc
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": "llm_configuration_error",
+            "message": "The LLM service is misconfigured. Contact the administrator.",
+        },
+    )
+
+
+@app.exception_handler(LLMUnavailableError)
+async def llm_unavailable_handler(
+    request: Request, exc: LLMUnavailableError
+) -> JSONResponse:
+    """
+    Transient LLM errors (connection, timeout, rate limit after backoff).
+    LLMRateLimitError inherits LLMUnavailableError so it is caught here too.
+    """
+    logger.error("LLM service unavailable: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": "llm_unavailable",
+            "message": str(exc),
+        },
+    )
+
+
+@app.exception_handler(LLMInvalidResponseError)
+async def llm_invalid_response_handler(
+    request: Request, exc: LLMInvalidResponseError
+) -> JSONResponse:
+    """LLM exhausted all schema-validation retries without producing valid output."""
+    logger.error("LLM invalid response after all retries: %s", exc)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "llm_invalid_response",
+            "message": str(exc),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dependency and request model
+# ---------------------------------------------------------------------------
 
 def get_analyzer(request: Request) -> IncidentAnalyzer:
     """Dependency injection: returns the analyzer from application state."""
@@ -111,6 +188,10 @@ class AnalyzeRequest(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.post("/api/v1/analyze")
 async def analyze_incident(
     req: AnalyzeRequest,
@@ -120,11 +201,12 @@ async def analyze_incident(
     Analyse an incident description and return a structured JSON response.
 
     HTTP status codes:
-      400 -- text is too short to provide meaningful context;
-      422 -- LLM failed to produce a valid response after all retries,
-             or request body is missing a required field;
-      503 -- LLM API is temporarily unavailable;
-      500 -- unexpected internal error.
+      200 -- analysis succeeded.
+      400 -- incident_text is too short to provide meaningful context.
+      422 -- request body is missing a required field (FastAPI/Pydantic),
+             or the LLM exhausted all retries without a valid response.
+      500 -- LLM API key is invalid or revoked (server misconfiguration).
+      503 -- LLM API is temporarily unavailable or rate-limited.
     """
     text = req.incident_text.strip()
     if len(text.split()) < _MIN_WORDS or len(text) < _MIN_CHARS:
@@ -136,19 +218,19 @@ async def analyze_incident(
             ),
         )
 
+    # Domain exceptions (LLMAuthenticationError, LLMUnavailableError,
+    # LLMInvalidResponseError) propagate to their registered global handlers.
+    # Only truly unexpected errors are caught here.
     try:
         result = await analyzer.analyze(text)
-        logger.info("Incident analysed. Category: %s", result.get("category"))
-        return result
-    except LLMInvalidResponseError as exc:
-        logger.error("LLM response validation error: %s", exc)
-        raise HTTPException(status_code=422, detail=str(exc))
-    except LLMUnavailableError as exc:
-        logger.error("LLM API unavailable: %s", exc)
-        raise HTTPException(status_code=503, detail=str(exc))
+    except (LLMAuthenticationError, LLMUnavailableError, LLMInvalidResponseError):
+        raise  # handled by global exception handlers above
     except Exception as exc:
-        logger.error("Unexpected error: %s", exc)
-        raise HTTPException(status_code=500, detail="Internal server error.")
+        logger.error("Unexpected error during analysis: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+
+    logger.info("Incident analysed. Category: %s", result.get("category"))
+    return result
 
 
 # Mount the static frontend last so it does not shadow API routes

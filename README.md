@@ -214,21 +214,23 @@ Each component has a single, well-defined responsibility and communicates throug
 
 ```text
 app/
-  main.py           — FastAPI app, lifespan lifecycle, HTTP routing
+  main.py           — FastAPI app, lifespan lifecycle, global exception handlers, HTTP routing
   settings.py       — Centralised pydantic-settings configuration (single source of truth)
   schemas.py        — Pydantic data contracts (IncidentAnalysis, Hypothesis)
   context.py        — Static knowledge base: system architecture + past incidents
   agent/
     __init__.py
-    analyzer.py     — Orchestrator: coordinates all pipeline stages
+    analyzer.py     — Orchestrator: coordinates pipeline stages; LLM-level retry with backoff
     retriever.py    — Stage 1+2: input parsing & keyword-based context retrieval
     prompt_builder.py — Stage 3: system prompt assembly (taxonomy, severity rubric, schema injection)
-    llm_client.py   — Stage 4: LLMClientProtocol + OpenAI implementation
-    exceptions.py   — Typed domain exceptions (LLMUnavailableError, LLMInvalidResponseError)
+    llm_client.py   — Stage 4: LLMClientProtocol + OpenAI implementation with typed exception mapping
+    exceptions.py   — Typed domain exception hierarchy (see Error Handling section)
 static/
   index.html        — Simple web UI
 tests/
-  test_agent.py     — Pytest suite (uses MockLLMClient, no real API calls)
+  conftest.py       — Shared fixtures and MockLLMClient stub
+  test_agent.py     — Unit tests (pipeline, retry logic, retriever, prompt builder)
+  test_api.py       — Integration tests (HTTP layer, all status codes, error response format)
 ```
 
 ### Pipeline Stages
@@ -248,7 +250,9 @@ User Input
 [3] PromptBuilder.build_system_prompt()  — inject architecture + context + taxonomy + JSON schema
     │
     ▼
-[4] LLMClientProtocol.complete()     — call LLM, validate with Pydantic
+[4] LLMClientProtocol.complete()     — call LLM (with per-request timeout)
+        │ RateLimitError?
+        └─► exponential backoff retry (up to llm_retry_attempts)
         │ ValidationError?
         └─► self-correction loop (up to max_retries): append error → ask LLM to fix
     │
@@ -268,18 +272,41 @@ prompt text lives in `PromptBuilder`, schema lives in `schemas.py`. Each module 
 and evolved independently.
 
 **Centralised Configuration.** `Settings` (pydantic-settings) validates all environment variables
-at startup. No `os.getenv()` calls are scattered across business-logic modules.
+at startup. No `os.getenv()` calls are scattered across business-logic modules. LLM timeout and
+retry policy are configurable via environment variables (`LLM_TIMEOUT_SECONDS`,
+`LLM_RETRY_ATTEMPTS`, `LLM_RETRY_DELAY_SECONDS`).
 
 **Schema Injection.** The exact Pydantic JSON schema is dynamically injected into the system prompt,
 enforcing a rigorous data contract on the LLM output.
 
-**Self-Correction Loop.** If the LLM returns invalid JSON or violates `min_length` constraints,
-Pydantic raises a `ValidationError`. The orchestrator appends the error details to the conversation
-history and requests a correction — up to `MAX_RETRIES` times.
+**Two Independent Retry Mechanisms.** The pipeline defends against two distinct failure modes:
+- *Schema-validation retry (self-correction loop)*: if the LLM returns invalid JSON or violates
+  field constraints, Pydantic raises a `ValidationError`. The orchestrator appends the error
+  details to the conversation and requests a fix — up to `max_retries` times.
+- *Transient-error retry with exponential backoff*: if the LLM API returns a rate-limit error,
+  `_call_llm()` retries with delay `base * 2^(attempt-1)` before giving up. Authentication
+  failures are never retried — they indicate a permanent misconfiguration.
 
-**Typed Domain Exceptions.** `LLMUnavailableError` (network/API failure → HTTP 503) and
-`LLMInvalidResponseError` (validation exhausted → HTTP 422) allow `main.py` to return
-precise HTTP status codes without catching bare `Exception`.
+**Typed Domain Exception Hierarchy.** All OpenAI SDK errors are translated at the client boundary
+into typed domain exceptions. Upstream code never imports from `openai`:
+
+```
+LLMAuthenticationError          — invalid API key (permanent)  → HTTP 500
+LLMUnavailableError             — connection / timeout / other → HTTP 503
+  └── LLMRateLimitError         — rate limit exceeded          → HTTP 503 (retried first)
+LLMInvalidResponseError         — schema validation exhausted  → HTTP 422
+```
+
+**Global Exception Handlers.** Three `@app.exception_handler` decorators in `main.py` translate
+domain exceptions into HTTP responses with a consistent structured format:
+
+```json
+{"code": "llm_unavailable", "message": "..."}
+```
+
+This keeps route handlers thin (no try/except for domain errors) and guarantees a uniform
+error contract across all endpoints. Authentication errors return a safe, non-leaking message
+that does not expose internal API key details to the client.
 
 **FastAPI Lifespan.** All initialisation (logger, LLM client, analyzer) happens inside the
 `lifespan` async context manager — not at module import time. This eliminates import-time
@@ -302,10 +329,6 @@ The current `incident_text` field is a raw string.
 Real observability pipelines would benefit from a structured input including
 `service`, `timestamp`, `environment`, and `correlation_id` fields for end-to-end tracing.
 
-### 3. LLM Resiliency
-Explicit request timeouts and circuit-breaker logic around `OpenAILLMClient` would prevent
-cascading failures when the upstream API is slow or rate-limiting.
-
-### 4. Prompt Versioning
+### 3. Prompt Versioning
 As the system scales, prompts should be stored in dedicated template files with version tags,
 enabling A/B testing and rollback without code changes.

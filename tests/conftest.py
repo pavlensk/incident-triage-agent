@@ -22,8 +22,11 @@ class MockLLMClient:
     Deterministic stub implementing LLMClientProtocol.
 
     Accepts a list of pre-set response strings and returns them sequentially
-    on each complete() call. Enables fully offline, reproducible tests without
+    on each complete() call.  Enables fully offline, reproducible tests without
     any network interaction -- a direct benefit of Dependency Inversion.
+
+    Raises StopIteration (propagated as a test error) if more calls are made
+    than pre-set responses, making accidental over-calling visible immediately.
     """
 
     def __init__(self, responses: list) -> None:
@@ -84,9 +87,18 @@ def minimal_valid_json() -> str:
     })
 
 
-def make_analyzer(responses: list, max_retries: int = 3) -> IncidentAnalyzer:
+def make_analyzer(
+    responses: list,
+    max_retries: int = 3,
+    llm_retry_attempts: int = 1,
+    llm_retry_delay_seconds: float = 0.0,
+) -> IncidentAnalyzer:
     """
     Factory function: build an IncidentAnalyzer backed by a MockLLMClient.
+
+    ``llm_retry_delay_seconds`` defaults to 0.0 so tests never sleep.
+    ``llm_retry_attempts`` defaults to 1 (no LLM-level retry) to keep
+    test behaviour predictable; set higher only when testing retry logic.
 
     Used directly in unit tests; also available to integration tests that need
     to override app.state.analyzer via FastAPI's dependency overrides.
@@ -96,4 +108,6 @@ def make_analyzer(responses: list, max_retries: int = 3) -> IncidentAnalyzer:
         retriever=ContextRetriever(),
         prompt_builder=PromptBuilder(),
         max_retries=max_retries,
+        llm_retry_attempts=llm_retry_attempts,
+        llm_retry_delay_seconds=llm_retry_delay_seconds,
     )
