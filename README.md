@@ -18,7 +18,8 @@ Focuses on architectural cleanliness, strict JSON data contracts, and LLM safety
    python -m venv venv
    # Windows: venv\Scripts\activate
    # Linux/Mac: source venv/bin/activate
-   pip install -r requirements.txt
+   pip install -r requirements.txt          # runtime only
+   pip install -r requirements-dev.txt      # runtime + test tools (pytest, pytest-cov)
 ```
 
 3. **Start the FastAPI server:**
@@ -34,12 +35,102 @@ Focuses on architectural cleanliness, strict JSON data contracts, and LLM safety
 
 ## Testing
 
-The project includes pytest tests covering the LLM retry logic and Pydantic validation (with mocked OpenAI responses).
-Run the test suite via:
+### Testing Strategy
+
+The test suite is organized into four layers.  Each layer has a distinct scope
+and purpose; together they provide coverage of correctness, reliability, and
+output quality without requiring a real OpenAI API key.
+
+| Layer | Location | Purpose |
+|-------|----------|---------|
+| **Unit** | `tests/unit/` + `tests/test_agent.py` | Isolated components — no I/O, no HTTP |
+| **Integration** | `tests/test_api.py` | HTTP layer wiring — TestClient + DI overrides |
+| **End-to-End** | `tests/e2e/` | Full scenarios — HTTP → pipeline → response |
+| **Evaluations** | `tests/evals/` | Output quality — taxonomy, severity, retrieval |
+
+#### Unit tests (`tests/unit/`, `tests/test_agent.py`)
+
+Test individual classes and functions in isolation.  The LLM is replaced by
+`MockLLMClient` — a deterministic stub that returns pre-set strings — so there
+are no network calls, no API keys, and no flakiness.
+
+Covered:
+- `test_schemas.py` — every Pydantic field constraint at its boundary value
+  (min/max length, literal enum, list size).
+- `test_exceptions.py` — inheritance chain and catch-at-right-level behaviour.
+- `test_llm_client.py` — `OpenAILLMClient` with `AsyncOpenAI` patched at the
+  module boundary: all five SDK→domain exception mappings (with `__cause__`
+  chaining), None/empty content guard, and double-wrap prevention by the
+  re-raise passthrough.
+- `test_agent.py` — `IncidentAnalyzer` pipeline stages, schema-validation retry
+  loop, rate-limit exponential backoff, auth-error propagation.
+- `InputParser` keyword extraction and stop-word filtering.
+- `PromptBuilder` system prompt and self-correction message content.
+
+#### Integration tests (`tests/test_api.py`)
+
+Test the HTTP layer end-to-end using FastAPI's `TestClient`.
+`app.dependency_overrides` replaces the real `IncidentAnalyzer` with a
+mock-backed version so tests are still offline and deterministic.
+
+Covered:
+- HTTP 200 with valid payload and structured JSON response.
+- HTTP 400 for too-short incident text (rejected before LLM call).
+- HTTP 422 for missing request body field (Pydantic) and for LLM
+  exhausting all validation retries.
+- HTTP 503 for transient LLM unavailability and rate-limit errors.
+- HTTP 500 for authentication failures (server misconfiguration).
+- HTTP 200 for `GET /health` liveness probe.
+- Structured error response format `{"code": "...", "message": "..."}`.
+- Static frontend served at root `/`.
+
+#### End-to-End tests (`tests/e2e/`)
+
+Simulate realistic user interactions with the full application stack.
+Only the LLM call is mocked (via `MockLLMClient`); every other component
+— routing, retriever, prompt builder, Pydantic validation — is the real
+production implementation.
+
+Covered:
+- All five canonical incident scenarios from the assignment specification.
+- Verify the 400 guard fires before the pipeline is entered.
+- Verify the self-correction loop is transparent to the HTTP caller (still 200).
+
+Gold-standard LLM responses live in `tests/e2e/conftest.py`.
+
+#### Evaluation tests (`tests/evals/`)
+
+Evaluate the *quality* of the system's output, not just its mechanical
+correctness.  Evals answer: "Does the system produce the right answer for
+known inputs?"
+
+| File | What it evaluates |
+|------|-------------------|
+| `test_taxonomy.py` | Category accuracy for all 6 taxonomy entries |
+| `test_severity.py` | Severity rubric adherence (high/medium/low) |
+| `test_retrieval.py` | Retriever precision, recall, fallback, keyword extraction |
+
+Gold-standard LLM responses per category live in `tests/evals/conftest.py`.
+To add a new eval scenario: add a fixture there and a parametrize row in
+the relevant test file — no other changes required.
+
+### Running Tests
 
 ```bash
+# Run the entire suite
 pytest tests/ -v
+
+# Run a single layer
+pytest tests/unit/ -v
+pytest tests/test_api.py -v
+pytest tests/e2e/ -v
+pytest tests/evals/ -v
+
+# Run with coverage report (requires pytest-cov)
+pytest tests/ --cov=app --cov-report=term-missing --cov-fail-under=80
 ```
+
+No API key is required to run any test.
 
 ### Manual Test Cases & Expected Outputs
 
@@ -202,46 +293,187 @@ Logs show severe reporting-service load on the primary DB concurrent with networ
 
 ---
 
-## High-Level Architecture & Resilience
+## Architecture
 
-* **Schema Injection:** The exact Pydantic JSON schema is dynamically injected into the system prompt, enforcing a rigorous data contract on the LLM.
-* **Self-Correction (Recovery Loop):** If the LLM generates invalid JSON (or violates min_length constraints), Pydantic raises an error. The orchestrator intercepts this, feeds the specific error back to the LLM, and forces a correction.
-* **UI Safety:** All LLM outputs are aggressively escaped on the frontend before DOM insertion to prevent XSS.
-* **Configuration:** Core LLM behavior (temperature, model_name, max_retries) is externalized to .env for safe and fast tuning.
+The agent is structured as an explicit multi-stage pipeline aligned with SOLID principles.
+Each component has a single, well-defined responsibility and communicates through clean interfaces.
 
-## Future Evolution (What I would do with more time)
-
-While the current MVP prioritizes KISS and rapid delivery, scaling this into a Tier-1 production service requires addressing several architectural debts to fully align with SOLID principles.
-
-### 1. Architectural Decoupling (SRP & Dependency Inversion)
-* **Deconstruct the "God-Class":** The current IncidentAgent handles parsing, retrieval, prompt assembly, validation, and LLM communication. This violates the Single Responsibility Principle. I would split this into distinct domain components: IncidentParser, ContextRetriever, PromptBuilder, and an orchestrating IncidentAnalyzer.
-* **Abstract the LLM Client:** Currently, business logic is tightly coupled to the OpenAI SDK. Introducing an LLMClientProtocol (Dependency Inversion) would allow injecting dummy clients for deterministic unit testing without monkey-patching, and make it trivial to swap OpenAI for Anthropic or local models.
-* **Settings Management:** Replace direct os.getenv calls scattered across files with a centralized pydantic-settings configuration object to ensure environment variables are validated at startup.
-
-### 2. Prompt & Taxonomy Centralization (DRY)
-* **Externalize Prompts:** Hardcoding the system prompt inside the execution method hinders testing and version control. Prompts should be extracted into dedicated template modules.
-* **Unify Taxonomy:** The incident categories and severity rubrics currently exist in prompts, tests, and documentation. Extracting these into a single configuration module will enforce DRY and prevent taxonomy drift as the system scales.
-
-### 3. Production Resiliency & Lifecycle
-* **App Lifecycle Management:** Remove import-time side effects (like logger initialization and global agent instantiation in main.py). These should be managed using FastAPI's lifespan context managers to ensure clean startup and teardown phases.
-* **Resiliency & Error Handling:** Explicit timeouts and max-retry limits must be wrapped around the LLM client. Additionally, generic Exception catching should be replaced with domain-specific typed exceptions (e.g., LLMUnavailableError, LLMInvalidResponseError).
-* **API Schema Expansion:** The input schema (incident_text) is too naive for real observability. Future iterations will require a richer Pydantic schema including service, timestamp, environment, and correlation_ids for end-to-end tracing.
-
-### 4. Advanced Retrieval (RAG)
-* **Deterministic Retrieval:** The current keyword-overlap approach is fragile and prone to false positives. A dedicated ContextRetriever using vector embeddings (e.g., pgvector), semantic scoring, and stop-words is required to ensure the LLM receives highly relevant historical context without context-window overflow.
-
-### Target Architecture Structure
+### Module Structure
 
 ```text
 app/
-  main.py
-  settings.py
-  schemas.py
+  main.py           — FastAPI app, lifespan lifecycle, global exception handlers, HTTP routing
+  settings.py       — Centralised pydantic-settings configuration (single source of truth)
+  schemas.py        — Pydantic data contracts (IncidentAnalysis, Hypothesis)
+  context.py        — Static knowledge base: system architecture + past incidents
   agent/
-    analyzer.py       # Orchestrator
-    prompt_builder.py # Externalized prompt templates
-    retriever.py      # Vector/Semantic retrieval
-    llm_client.py     # Protocol and OpenAI implementation
-    exceptions.py     # Typed domain errors
-  context.py
+    __init__.py
+    analyzer.py       — Orchestrator: coordinates pipeline stages; LLM-level retry with backoff
+    input_parser.py   — Stage 1: input normalisation and keyword extraction (SRP)
+    retriever.py      — Stage 2: keyword-overlap context retrieval (RAG placeholder)
+    prompt_builder.py — Stage 3: system prompt assembly (taxonomy, severity rubric, schema injection)
+    llm_client.py     — Stage 4: LLMClientProtocol + OpenAI implementation with typed exception mapping
+    exceptions.py     — Typed domain exception hierarchy (see Error Handling section)
+static/
+  index.html        — Simple web UI
+tests/
+  conftest.py       — Shared fixtures and MockLLMClient stub
+  test_agent.py     — Unit tests (pipeline, retry logic, InputParser, PromptBuilder)
+  test_api.py       — Integration tests (HTTP layer, all status codes, error response format)
+  unit/
+    test_schemas.py     — Pydantic field constraints at boundary values
+    test_exceptions.py  — Domain exception hierarchy and catch-at-right-level behaviour
+    test_llm_client.py    — OpenAILLMClient: SDK exception mapping, content guards, passthrough
+    test_input_parser.py  — InputParser: keyword extraction, stop-word filtering, hyphen normalisation, edge cases
+  e2e/
+    test_system.py  — Five canonical incident scenarios through the full stack
+  evals/
+    test_taxonomy.py   — Category accuracy for all 6 taxonomy entries
+    test_severity.py   — Severity rubric adherence (high / medium / low)
+    test_retrieval.py  — Retriever precision, recall, fallback, keyword extraction
 ```
+
+### Pipeline Stages
+
+The request flows through four explicit, isolated stages:
+
+```
+User Input
+    │
+    ▼
+[1] InputParser.parse_input()        — normalise text, extract keywords
+    │
+    ▼
+[2] ContextRetriever.retrieve()      — keyword-overlap RAG against past incidents
+    │
+    ▼
+[3] PromptBuilder.build_system_prompt()  — inject architecture + context + taxonomy + JSON schema
+    │
+    ▼
+[4] LLMClientProtocol.complete()     — call LLM (with per-request timeout)
+        │ RateLimitError?
+        └─► exponential backoff retry (up to llm_retry_attempts)
+        │ ValidationError?
+        └─► self-correction loop (up to max_retries): append error → ask LLM to fix
+    │
+    ▼
+Structured IncidentAnalysis JSON
+```
+
+### Key Architectural Decisions
+
+**Dependency Inversion (LLMClientProtocol).** Business logic depends on the `LLMClientProtocol`
+abstract interface, not the concrete `openai` SDK. Tests inject `MockLLMClient` — a simple stub
+returning pre-set strings — without any monkey-patching. Swapping OpenAI for Anthropic or a local
+model requires only a new `LLMClientProtocol` implementation.
+
+**Single Responsibility.** `IncidentAnalyzer` only orchestrates. Input normalisation and keyword
+extraction live in `InputParser` (Stage 1); context retrieval lives in `ContextRetriever` (Stage 2);
+prompt text lives in `PromptBuilder`; schema lives in `schemas.py`. Each module can be tested
+and evolved independently.
+
+**Centralised Configuration.** `Settings` (pydantic-settings) validates all environment variables
+at startup. No `os.getenv()` calls are scattered across business-logic modules. LLM timeout and
+retry policy are configurable via environment variables (`LLM_TIMEOUT_SECONDS`,
+`LLM_RETRY_ATTEMPTS`, `LLM_RETRY_DELAY_SECONDS`).
+
+**Schema Injection.** The exact Pydantic JSON schema is dynamically injected into the system prompt,
+enforcing a rigorous data contract on the LLM output.
+
+**Two Independent Retry Mechanisms.** The pipeline defends against two distinct failure modes:
+- *Schema-validation retry (self-correction loop)*: if the LLM returns invalid JSON or violates
+  field constraints, Pydantic raises a `ValidationError`. The orchestrator appends the error
+  details to the conversation and requests a fix — up to `max_retries` times.
+- *Transient-error retry with exponential backoff*: if the LLM API returns a rate-limit error,
+  `_call_llm()` retries with delay `base * 2^(attempt-1)` before giving up. Authentication
+  failures are never retried — they indicate a permanent misconfiguration.
+
+**Typed Domain Exception Hierarchy.** All OpenAI SDK errors are translated at the client boundary
+into typed domain exceptions. Upstream code never imports from `openai`:
+
+```
+LLMAuthenticationError          — invalid API key (permanent)  → HTTP 500
+LLMUnavailableError             — connection / timeout / other → HTTP 503
+  └── LLMRateLimitError         — rate limit exceeded          → HTTP 503 (retried first)
+LLMInvalidResponseError         — schema validation exhausted  → HTTP 422
+```
+
+**Global Exception Handlers.** Three `@app.exception_handler` decorators in `main.py` translate
+domain exceptions into HTTP responses with a consistent structured format:
+
+```json
+{"code": "llm_unavailable", "message": "..."}
+```
+
+This keeps route handlers thin (no try/except for domain errors) and guarantees a uniform
+error contract across all endpoints. Authentication errors return a safe, non-leaking message
+that does not expose internal API key details to the client.
+
+**FastAPI Lifespan.** All initialisation (logger, LLM client, analyzer) happens inside the
+`lifespan` async context manager — not at module import time. This eliminates import-time
+side effects and makes the startup/teardown sequence explicit and testable.
+
+---
+
+## Trade-offs & Design Decisions
+
+### Keyword Retrieval vs. Vector Search
+The `ContextRetriever` uses keyword overlap (token matching) rather than vector embeddings.
+This was a deliberate trade-off: it requires zero infrastructure, has no runtime cost, and is
+fully testable offline.  The `InputParser`/`ContextRetriever` split means the keyword backend
+can be replaced with pgvector or FAISS by implementing the same `retrieve(parsed_data)` interface
+in a new class — no changes to the orchestrator or tests required.
+
+### Free-form `category` vs. Strict `Literal`
+The `category` field in `IncidentAnalysis` is a free-form `str` rather than a `Literal` over
+`TAXONOMY_CATEGORIES`.  Enforcing a strict enum would trigger unnecessary self-correction
+retries for responses that are semantically correct but phrased slightly differently.
+Category accuracy is validated separately in `tests/evals/test_taxonomy.py` using
+gold-standard fixtures, which gives the same regression coverage without imposing runtime cost.
+
+### JSON Mode vs. Function Calling
+The OpenAI `response_format={"type": "json_object"}` mode is used instead of function calling.
+JSON mode is simpler to implement, works with all GPT-4 model variants, and the explicit schema
+injected into the system prompt provides equivalent structural guarantees.  Function calling
+would add stronger type enforcement at the API level but requires a schema serialisation step
+and is harder to test offline.
+
+### In-memory Knowledge Base
+`PAST_INCIDENTS_LIST` is a static list defined in `context.py`.  For a production deployment,
+this would be replaced by a database or vector store queried at runtime.  The current design
+keeps the architecture correct (retrieval is isolated behind `ContextRetriever`) while avoiding
+operational dependencies for the proof-of-concept.
+
+### No Authentication on the API
+The `/api/v1/analyze` endpoint has no authentication layer.  In production, an API gateway or
+reverse proxy would enforce auth (API keys, OAuth2) before requests reach FastAPI.  Adding it
+directly to the FastAPI app would not change the internal architecture.
+
+### `dict[str, Any]` vs. `@dataclass ParsedInput` for Pipeline Data Transfer
+`InputParser.parse_input()` returns `dict[str, Any]` (keys `raw_text` and `keywords`) rather than
+a typed `@dataclass ParsedInput(raw_text: str, keywords: list[str])`.  A dataclass would make the
+Stage 1 → Stage 2 interface explicit and catch key-name typos at write time rather than at runtime.
+The plain dict was chosen to keep the interface minimal for a proof-of-concept; promoting it to a
+`ParsedInput` dataclass is a low-risk, high-readability improvement for a production codebase and
+would not require any changes to the orchestrator or retrieval logic.
+
+---
+
+## Future Improvements
+
+The current implementation deliberately prioritises clean architecture over feature completeness.
+The following items remain as natural next steps:
+
+### 1. Advanced Retrieval (RAG)
+The current keyword-overlap retriever is a functional placeholder.
+A production system would use vector embeddings (e.g., pgvector or FAISS) with semantic scoring
+to ensure the LLM receives the most relevant historical context without polluting the context window.
+
+### 2. Richer Input Schema
+The current `incident_text` field is a raw string.
+Real observability pipelines would benefit from a structured input including
+`service`, `timestamp`, `environment`, and `correlation_id` fields for end-to-end tracing.
+
+### 3. Prompt Versioning
+As the system scales, prompts should be stored in dedicated template files with version tags,
+enabling A/B testing and rollback without code changes.

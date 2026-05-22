@@ -1,133 +1,253 @@
-import pytest
+"""
+Unit tests for the incident analysis agent pipeline.
+
+Uses MockLLMClient from conftest.py -- no monkey-patching, no real API calls.
+The make_analyzer() factory is also defined in conftest and available here
+implicitly through pytest's conftest discovery.
+"""
 import json
-from unittest.mock import AsyncMock, MagicMock
-from app.agent import IncidentAgent
 
-@pytest.fixture
-def mock_agent():
-    # Initialize with a dummy key to prevent real API calls during tests
-    agent = IncidentAgent(api_key="dummy_key")
-    agent.client.chat.completions.create = AsyncMock()
-    return agent
+import pytest
 
-@pytest.mark.asyncio
-async def test_happy_path_canonical_example(mock_agent):
-    """Test that the agent perfectly processes the exact example from the assignment PDF."""
-    
-    # Exact input from the assignment
-    incident_text = """Customers complain that card payments often fail, and transactions do not go through.
-payment-service logs show many timeouts when calling PayGate, starting from 12:05 UTC.
-Other services look normal."""
-    
-    # Expected JSON (includes exact strings from assignment + our strict schema fields)
-    valid_json = json.dumps({
-        "category": "External payment provider issue",
-        "severity": "high",
-        "severity_reason": "Massive payment failures directly impact revenue.",
-        "affected_users": "All customers attempting card payments",
-        "summary": "The external provider PayGate is not responding in time, causing mass card payment failures.",
-        "hypotheses": [
-            {
-                "title": "Degradation or incident on the PayGate side",
-                "reasoning": "Timeouts are observed only when calling PayGate, other services remain stable.",
-                "next_steps": [
-                    "Check PayGate status page and recent provider notifications.",
-                    "Compare error and latency metrics for PayGate vs other payment providers.",
-                    "If possible, temporarily shift part of the traffic to an alternative provider."
-                ]
-            }
-        ]
-    })
-    
-    mock_choice = MagicMock()
-    mock_choice.message.content = valid_json
-    mock_agent.client.chat.completions.create.return_value = MagicMock(choices=[mock_choice])
+from app.agent.analyzer import IncidentAnalyzer
+from app.agent.input_parser import InputParser
+from app.agent.retriever import ContextRetriever
+from app.agent.prompt_builder import PromptBuilder
+from app.agent.exceptions import (
+    LLMAuthenticationError,
+    LLMInvalidResponseError,
+    LLMRateLimitError,
+    LLMUnavailableError,
+)
+from tests.conftest import MockLLMClient, make_analyzer
 
-    # Execute analysis
-    result = await mock_agent.analyze(incident_text)
-    
-    # Strict assertions matching the assignment requirements
-    assert result["category"] == "External payment provider issue"
-    assert result["severity"] == "high"
-    assert result["summary"] == "The external provider PayGate is not responding in time, causing mass card payment failures."
-    
-    assert len(result["hypotheses"]) == 1
-    hypothesis = result["hypotheses"][0]
-    
-    assert hypothesis["title"] == "Degradation or incident on the PayGate side"
-    assert hypothesis["reasoning"] == "Timeouts are observed only when calling PayGate, other services remain stable."
-    assert len(hypothesis["next_steps"]) == 3
-    assert hypothesis["next_steps"][0] == "Check PayGate status page and recent provider notifications."
 
-@pytest.mark.asyncio
-async def test_retry_on_invalid_json(mock_agent):
-    """Test the recovery strategy: invalid JSON on first try, valid on second."""
+# ---------------------------------------------------------------------------
+# Unit tests -- agent pipeline (happy path + validation retry)
+# ---------------------------------------------------------------------------
+
+async def test_happy_path_canonical_example(valid_paygate_json):
+    """Successful analysis of the canonical example from the assignment."""
+    incident_text = (
+        "Customers complain that card payments often fail, and transactions do not go through.\n"
+        "payment-service logs show many timeouts when calling PayGate, starting from 12:05 UTC.\n"
+        "Other services look normal."
+    )
+
+    analyzer = make_analyzer([valid_paygate_json])
+    result = await analyzer.analyze(incident_text)
+
+    assert result.category == "External payment provider issue"
+    assert result.severity == "high"
+    assert "PayGate" in result.summary
+    assert len(result.hypotheses) == 1
+
+    hypothesis = result.hypotheses[0]
+    assert hypothesis.title == "Degradation or incident on the PayGate side"
+    assert len(hypothesis.next_steps) == 3
+
+
+async def test_retry_on_invalid_json(minimal_valid_json):
+    """
+    Self-correction loop: first response is invalid -> retry -> success.
+
+    Verifies that MockLLMClient was called exactly twice, confirming
+    the correction loop actually fired.
+    """
     incident_text = "Sharp increase in response time for /payments/create (up to 5-7 seconds)."
-    invalid_json = '{"category": "Missing fields"}' 
-    
-    valid_json = json.dumps({
-        "category": "DB degradation",
-        "severity": "medium",
-        "severity_reason": "Testing recovery mechanism.",
-        "affected_users": "None",
-        "summary": "This is a valid summary of length > 10.",
-        "hypotheses": [
-            {
-                "title": "Valid hypothesis title", 
-                "reasoning": "Reasoning is long enough to pass validation.", 
-                "next_steps": ["Step 1 to check", "Step 2 to verify"]
-            }
-        ]
-    })
+    invalid_json = '{"category": "Missing required fields"}'
 
-    mock_choice_1 = MagicMock()
-    mock_choice_1.message.content = invalid_json
-    mock_choice_2 = MagicMock()
-    mock_choice_2.message.content = valid_json
-    
-    mock_agent.client.chat.completions.create.side_effect = [
-        MagicMock(choices=[mock_choice_1]), 
-        MagicMock(choices=[mock_choice_2])
-    ]
+    mock_client = MockLLMClient([invalid_json, minimal_valid_json])
+    analyzer = IncidentAnalyzer(
+        llm_client=mock_client,
+        input_parser=InputParser(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        max_retries=2,
+        llm_retry_attempts=1,
+        llm_retry_delay_seconds=0.0,
+    )
 
-    result = await mock_agent.analyze(incident_text, max_retries=2)
-    
-    assert result["category"] == "DB degradation"
-    assert mock_agent.client.chat.completions.create.call_count == 2
+    result = await analyzer.analyze(incident_text)
 
-@pytest.mark.asyncio
-async def test_failure_after_max_retries(mock_agent):
-    """Test that ValueError is raised if all retries fail."""
-    incident_text = "Some users cannot log in via the mobile app."
+    assert result.category == "DB degradation"
+    assert mock_client.call_count == 2, "Self-correction loop should have called the LLM twice"
+
+
+async def test_failure_after_max_retries():
+    """LLMInvalidResponseError must be raised once all retry attempts are exhausted."""
+    incident_text = "Some users cannot log in via the mobile app due to auth failures."
     invalid_json = '{"bad": "data"}'
-    
-    mock_choice = MagicMock()
-    mock_choice.message.content = invalid_json
-    mock_agent.client.chat.completions.create.return_value = MagicMock(choices=[mock_choice])
 
-    with pytest.raises(ValueError, match="Failed to generate a valid response"):
-        await mock_agent.analyze(incident_text, max_retries=2)
+    analyzer = make_analyzer([invalid_json, invalid_json], max_retries=2)
 
-def test_retrieve_context_semantic(mock_agent):
-    """Test that the RAG retrieval logic selects the semantically correct past incidents."""
-    
-    # Test Case 1: SMTP / Emails
-    smtp_parsed_data = {
-        "raw_text": "Users are not receiving emails",
-        "keywords": ["users", "receiving", "emails", "smtp"]
-    }
-    smtp_context = mock_agent._retrieve_context(smtp_parsed_data)
-    
-    assert "SMTP provider" in smtp_context
-    # Ensure it didn't pull the PayGate incident
-    assert "PayGate provider" not in smtp_context
+    with pytest.raises(LLMInvalidResponseError, match="Failed to generate a valid response"):
+        await analyzer.analyze(incident_text)
 
-    # Test Case 2: DB / Reporting Load
-    db_parsed_data = {
-        "raw_text": "CPU load is high on PostgreSQL due to reporting",
-        "keywords": ["cpu", "load", "postgresql", "reporting"]
-    }
-    db_context = mock_agent._retrieve_context(db_parsed_data)
-    
-    assert "reporting-service" in db_context
-    assert "DB dashboards show high CPU" in db_context
+
+# ---------------------------------------------------------------------------
+# Unit tests -- LLM-level retry (rate limit backoff)
+# ---------------------------------------------------------------------------
+
+async def test_rate_limit_retry_succeeds(valid_paygate_json):
+    """
+    Rate limit on the first LLM call, success on retry.
+
+    Verifies that the exponential-backoff retry in _call_llm() fires and
+    that the overall analysis still succeeds.
+    """
+    incident_text = (
+        "Customers cannot pay by card, payment-service logs show timeouts "
+        "when calling PayGate starting at 14:00 UTC."
+    )
+
+    call_count = 0
+
+    class RateLimitThenSuccessClient:
+        async def complete(self, messages: list) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise LLMRateLimitError("Rate limited on first attempt")
+            return valid_paygate_json
+
+    analyzer = IncidentAnalyzer(
+        llm_client=RateLimitThenSuccessClient(),
+        input_parser=InputParser(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        llm_retry_attempts=2,
+        llm_retry_delay_seconds=0.0,  # no real sleep in tests
+    )
+
+    result = await analyzer.analyze(incident_text)
+
+    assert result.category == "External payment provider issue"
+    assert call_count == 2, "LLM should have been called exactly twice (1 rate-limited + 1 success)"
+
+
+async def test_rate_limit_exhausted_raises():
+    """
+    Rate limit on every attempt: LLMRateLimitError must propagate after all
+    retries are exhausted.  Since LLMRateLimitError IS-A LLMUnavailableError,
+    catching either class works.
+    """
+    incident_text = (
+        "Customers cannot pay by card, payment-service logs show timeouts "
+        "when calling PayGate starting at 14:00 UTC."
+    )
+
+    class AlwaysRateLimitClient:
+        async def complete(self, messages: list) -> str:
+            raise LLMRateLimitError("Always rate limited")
+
+    analyzer = IncidentAnalyzer(
+        llm_client=AlwaysRateLimitClient(),
+        input_parser=InputParser(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        llm_retry_attempts=2,
+        llm_retry_delay_seconds=0.0,
+    )
+
+    # LLMRateLimitError inherits from LLMUnavailableError
+    with pytest.raises(LLMUnavailableError):
+        await analyzer.analyze(incident_text)
+
+
+async def test_auth_error_propagates_immediately():
+    """
+    Authentication errors must propagate immediately without any retry,
+    because retrying with a bad API key will never succeed.
+    """
+    incident_text = (
+        "Customers cannot pay by card, payment-service logs show timeouts "
+        "when calling PayGate starting at 14:00 UTC."
+    )
+
+    call_count = 0
+
+    class AuthErrorClient:
+        async def complete(self, messages: list) -> str:
+            nonlocal call_count
+            call_count += 1
+            raise LLMAuthenticationError("Invalid API key")
+
+    analyzer = IncidentAnalyzer(
+        llm_client=AuthErrorClient(),
+        input_parser=InputParser(),
+        retriever=ContextRetriever(),
+        prompt_builder=PromptBuilder(),
+        llm_retry_attempts=3,       # high retry count -- should NOT be used
+        llm_retry_delay_seconds=0.0,
+    )
+
+    with pytest.raises(LLMAuthenticationError):
+        await analyzer.analyze(incident_text)
+
+    assert call_count == 1, "Authentication error must not trigger any retry"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests -- InputParser
+# ---------------------------------------------------------------------------
+
+def test_input_parser_selects_smtp_incident():
+    """SMTP / email query should produce keywords that match INC-103, not INC-101 (PayGate)."""
+    parser = InputParser()
+    retriever = ContextRetriever()
+    parsed = parser.parse_input("Users are not receiving emails from smtp provider")
+    context = retriever.retrieve(parsed)
+    assert "SMTP provider" in context
+    assert "PayGate provider" not in context
+
+
+def test_input_parser_selects_db_incident():
+    """DB / reporting load query should produce keywords that match INC-102."""
+    parser = InputParser()
+    retriever = ContextRetriever()
+    parsed = parser.parse_input("CPU load is high on PostgreSQL due to reporting queries")
+    context = retriever.retrieve(parsed)
+    assert "reporting-service" in context
+    assert "DB dashboards show high CPU" in context
+
+
+def test_input_parser_selects_auth_incident():
+    """Auth failure query should produce keywords matching INC-104."""
+    parser = InputParser()
+    retriever = ContextRetriever()
+    parsed = parser.parse_input("auth service returns 401 errors with invalid token signatures")
+    context = retriever.retrieve(parsed)
+    assert "401" in context or "token" in context.lower()
+
+
+def test_retriever_fallback_on_no_match():
+    """When no incidents match, the retriever must return the first two as a fallback."""
+    parser = InputParser()
+    retriever = ContextRetriever()
+    parsed = parser.parse_input("xyzzy qwerty frobnicate something unknown")
+    context = retriever.retrieve(parsed)
+    assert "INC-101" in context or "INC-102" in context
+
+
+# ---------------------------------------------------------------------------
+# Unit tests -- PromptBuilder
+# ---------------------------------------------------------------------------
+
+def test_prompt_builder_contains_schema_and_architecture():
+    """The system prompt must include the JSON schema, architecture, and severity rules."""
+    builder = PromptBuilder()
+    prompt = builder.build_system_prompt("Test context")
+
+    assert "json" in prompt.lower()   # schema is present
+    assert "api-gateway" in prompt    # architecture is present
+    assert "Test context" in prompt   # RAG context is embedded
+    assert "severity" in prompt       # severity rules are present
+
+
+def test_prompt_builder_correction_message_contains_errors():
+    """Correction message must pass through the Pydantic error details."""
+    builder = PromptBuilder()
+    msg = builder.build_correction_message('{"error": "field required"}')
+    assert "field required" in msg
+    assert "Pydantic" in msg
