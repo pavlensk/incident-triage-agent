@@ -58,9 +58,13 @@ Covered:
 - `test_schemas.py` — every Pydantic field constraint at its boundary value
   (min/max length, literal enum, list size).
 - `test_exceptions.py` — inheritance chain and catch-at-right-level behaviour.
+- `test_llm_client.py` — `OpenAILLMClient` with `AsyncOpenAI` patched at the
+  module boundary: all five SDK→domain exception mappings (with `__cause__`
+  chaining), None/empty content guard, and double-wrap prevention by the
+  re-raise passthrough.
 - `test_agent.py` — `IncidentAnalyzer` pipeline stages, schema-validation retry
   loop, rate-limit exponential backoff, auth-error propagation.
-- Retriever keyword extraction and stop-word filtering.
+- `InputParser` keyword extraction and stop-word filtering.
 - `PromptBuilder` system prompt and self-correction message content.
 
 #### Integration tests (`tests/test_api.py`)
@@ -76,6 +80,7 @@ Covered:
   exhausting all validation retries.
 - HTTP 503 for transient LLM unavailability and rate-limit errors.
 - HTTP 500 for authentication failures (server misconfiguration).
+- HTTP 200 for `GET /health` liveness probe.
 - Structured error response format `{"code": "...", "message": "..."}`.
 - Static frontend served at root `/`.
 
@@ -303,17 +308,28 @@ app/
   context.py        — Static knowledge base: system architecture + past incidents
   agent/
     __init__.py
-    analyzer.py     — Orchestrator: coordinates pipeline stages; LLM-level retry with backoff
-    retriever.py    — Stage 1+2: input parsing & keyword-based context retrieval
+    analyzer.py       — Orchestrator: coordinates pipeline stages; LLM-level retry with backoff
+    input_parser.py   — Stage 1: input normalisation and keyword extraction (SRP)
+    retriever.py      — Stage 2: keyword-overlap context retrieval (RAG placeholder)
     prompt_builder.py — Stage 3: system prompt assembly (taxonomy, severity rubric, schema injection)
-    llm_client.py   — Stage 4: LLMClientProtocol + OpenAI implementation with typed exception mapping
-    exceptions.py   — Typed domain exception hierarchy (see Error Handling section)
+    llm_client.py     — Stage 4: LLMClientProtocol + OpenAI implementation with typed exception mapping
+    exceptions.py     — Typed domain exception hierarchy (see Error Handling section)
 static/
   index.html        — Simple web UI
 tests/
   conftest.py       — Shared fixtures and MockLLMClient stub
-  test_agent.py     — Unit tests (pipeline, retry logic, retriever, prompt builder)
+  test_agent.py     — Unit tests (pipeline, retry logic, InputParser, PromptBuilder)
   test_api.py       — Integration tests (HTTP layer, all status codes, error response format)
+  unit/
+    test_schemas.py     — Pydantic field constraints at boundary values
+    test_exceptions.py  — Domain exception hierarchy and catch-at-right-level behaviour
+    test_llm_client.py  — OpenAILLMClient: SDK exception mapping, content guards, passthrough
+  e2e/
+    test_system.py  — Five canonical incident scenarios through the full stack
+  evals/
+    test_taxonomy.py   — Category accuracy for all 6 taxonomy entries
+    test_severity.py   — Severity rubric adherence (high / medium / low)
+    test_retrieval.py  — Retriever precision, recall, fallback, keyword extraction
 ```
 
 ### Pipeline Stages
@@ -324,7 +340,7 @@ The request flows through four explicit, isolated stages:
 User Input
     │
     ▼
-[1] ContextRetriever.parse_input()   — normalise text, extract keywords
+[1] InputParser.parse_input()        — normalise text, extract keywords
     │
     ▼
 [2] ContextRetriever.retrieve()      — keyword-overlap RAG against past incidents
@@ -350,8 +366,9 @@ abstract interface, not the concrete `openai` SDK. Tests inject `MockLLMClient` 
 returning pre-set strings — without any monkey-patching. Swapping OpenAI for Anthropic or a local
 model requires only a new `LLMClientProtocol` implementation.
 
-**Single Responsibility.** `IncidentAnalyzer` only orchestrates. Parsing lives in `ContextRetriever`,
-prompt text lives in `PromptBuilder`, schema lives in `schemas.py`. Each module can be tested
+**Single Responsibility.** `IncidentAnalyzer` only orchestrates. Input normalisation and keyword
+extraction live in `InputParser` (Stage 1); context retrieval lives in `ContextRetriever` (Stage 2);
+prompt text lives in `PromptBuilder`; schema lives in `schemas.py`. Each module can be tested
 and evolved independently.
 
 **Centralised Configuration.** `Settings` (pydantic-settings) validates all environment variables
